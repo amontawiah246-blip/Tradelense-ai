@@ -368,7 +368,7 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
       USDCHF: 'frxUSDCHF', AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD',
       BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD', BNBUSD: 'cryBNBUSD',
       XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD',
-      USOIL: 'frxUSOIL', XNGUSD: 'frxXPDUSD', STOXX50: 'OTC_STOXX50E', VOL75: 'R_75'
+      USOIL: 'frxUSOIL', XNGUSD: 'frxXPDUSD', STOXX50: 'OTC_STOXX50', VOL75: 'R_75'
     };
 
     const reverseSymbolMap: Record<string, string> = {};
@@ -378,44 +378,54 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
 
     const ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089');
     const openingPrices: Record<string, number> = {};
+    let pollInterval: any;
 
     ws.onopen = () => {
-      // Deriv requires individual subscriptions per symbol
-      Object.values(derivSymbolMap).forEach(symbol => {
-        ws.send(JSON.stringify({
-          ticks: symbol,
-          subscribe: 1
-        }));
-      });
+      // Deriv restricts 'ticks' subscriptions for some symbols now,
+      // but allows single tick history lookups without subscribe.
+      const fetchPrices = () => {
+        if (ws.readyState === WebSocket.OPEN) {
+          Object.values(derivSymbolMap).forEach(symbol => {
+            ws.send(JSON.stringify({
+              ticks_history: symbol,
+              end: 'latest',
+              count: 1,
+              style: 'ticks'
+            }));
+          });
+        }
+      };
+      
+      fetchPrices();
+      pollInterval = setInterval(fetchPrices, 3000); // Poll every 3s
     };
 
     ws.onmessage = (msg) => {
       const data = JSON.parse(msg.data);
-      if (data.tick) {
-        const derivSymbol = data.tick.symbol;
+      if (data.history && data.history.prices && data.history.prices.length > 0) {
+        const derivSymbol = data.echo_req.ticks_history;
         const appSymbol = reverseSymbolMap[derivSymbol];
         if (appSymbol) {
-          const ask = data.tick.ask;
-          const bid = data.tick.bid;
-          const quote = data.tick.quote;
-
+          const quote = data.history.prices[0];
+          
           if (!openingPrices[appSymbol]) {
             openingPrices[appSymbol] = quote;
           }
-
           const openPrice = openingPrices[appSymbol];
           const change = openPrice ? ((quote - openPrice) / openPrice) * 100 : 0;
 
           setLivePrices(prev => {
             const previousData = prev[appSymbol];
             const history = previousData?.history || [];
-            const newHistory = [...history, quote].slice(-30); // keep last 30 ticks for sparkline
-
+            // Only add if changed
+            const lastQuote = history[history.length - 1];
+            const newHistory = (lastQuote !== quote) ? [...history, quote].slice(-30) : history;
+            
             return {
               ...prev,
               [appSymbol]: {
-                bid: bid || quote,
-                ask: ask || quote,
+                bid: quote,
+                ask: quote, // History doesn't provide spread, just use quote
                 change: change,
                 history: newHistory
               }
@@ -423,6 +433,10 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
           });
         }
       }
+    };
+    
+    ws.onclose = () => {
+      if (pollInterval) clearInterval(pollInterval);
     };
 
     // Binance WebSocket Fallback for Crypto (globally reliable)

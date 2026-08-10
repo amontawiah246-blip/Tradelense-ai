@@ -20,7 +20,8 @@ Upgrades over v2:
 import sys
 import json
 import math
-import sqlite3
+import psycopg2
+import os
 import os
 import random
 from datetime import datetime, timezone, timedelta
@@ -57,7 +58,17 @@ try:
 except ImportError:
     pass
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'quant_signals.db')
+
+def get_db_connection():
+    import psycopg2
+    import os
+    return psycopg2.connect(
+        host=os.environ.get('SQL_HOST'),
+        dbname=os.environ.get('SQL_DB_NAME'),
+        user=os.environ.get('SQL_ADMIN_USER'),
+        password=os.environ.get('SQL_ADMIN_PASSWORD')
+    )
+
 
 # In-memory candle cache — avoid re-fetching same candles within 2 minutes
 # Key: "SYMBOL_GRANULARITY" → {candles: [...], timestamp: float}
@@ -499,24 +510,12 @@ def build_quant_evidence(win_prob: dict, trade_exp: dict, ml_score: dict, backte
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def init_db():
-    if os.path.exists(DB_PATH):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute('SELECT 1 FROM sqlite_master LIMIT 1')
-            conn.close()
-        except sqlite3.DatabaseError:
-            try: conn.close()
-            except: pass
-            try:
-                os.remove(DB_PATH)
-                print('WARNING: Corrupt DB removed. Creating fresh.', file=sys.stderr)
-            except OSError as e:
-                print(f'WARNING: Could not remove corrupt DB: {e}', file=sys.stderr)
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
+        
         c.execute('''CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             asset TEXT NOT NULL, mode TEXT, timestamp TEXT NOT NULL,
             direction TEXT, entry_low REAL, entry_high REAL,
             tp1 REAL, tp2 REAL, tp3 REAL, sl REAL,
@@ -532,24 +531,7 @@ def init_db():
             hard_block_reason TEXT DEFAULT NULL,
             wait_reason TEXT DEFAULT NULL
         )''')
-        # v13: add columns to any pre-existing signals table from before this patch
-        # (SQLite requires ALTER TABLE for existing DBs — CREATE TABLE IF NOT EXISTS
-        # won't add new columns to an already-existing table)
-        existing_cols = [row[1] for row in c.execute("PRAGMA table_info(signals)").fetchall()]
-        new_cols = {
-            'verdict':                  "TEXT DEFAULT 'EXECUTE'",
-            'current_price_at_signal':  'REAL DEFAULT NULL',
-            'win_probability_pct':      'REAL DEFAULT NULL',
-            'expected_value_r':         'REAL DEFAULT NULL',
-            'hard_block_reason':        'TEXT DEFAULT NULL',
-            'wait_reason':              'TEXT DEFAULT NULL',
-        }
-        for col, coltype in new_cols.items():
-            if col not in existing_cols:
-                try:
-                    c.execute(f'ALTER TABLE signals ADD COLUMN {col} {coltype}')
-                except Exception:
-                    pass  # column likely already exists from a concurrent init
+
         c.execute('''CREATE TABLE IF NOT EXISTS asset_weights (
             asset TEXT PRIMARY KEY,
             w_structure REAL DEFAULT 20, w_liquidity REAL DEFAULT 15,
@@ -559,14 +541,17 @@ def init_db():
             total_trades INTEGER DEFAULT 0, win_rate REAL DEFAULT NULL,
             last_updated TEXT DEFAULT NULL
         )''')
+        
         c.execute('''CREATE TABLE IF NOT EXISTS daily_performance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL,
+            id SERIAL PRIMARY KEY, date TEXT NOT NULL,
             asset TEXT NOT NULL, trades INTEGER DEFAULT 0,
             wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
-            pnl_atr REAL DEFAULT 0, win_rate REAL DEFAULT NULL
+            pnl_atr REAL DEFAULT 0, win_rate REAL DEFAULT NULL,
+            UNIQUE(date, asset)
         )''')
+
         c.execute('''CREATE TABLE IF NOT EXISTS active_thesis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             asset TEXT NOT NULL,
             mode TEXT NOT NULL,
             direction TEXT NOT NULL,
@@ -587,49 +572,31 @@ def init_db():
             structural_anchor TEXT,
             times_confirmed INTEGER DEFAULT 1,
             invalidated_at TEXT DEFAULT NULL,
-            invalidated_reason TEXT DEFAULT NULL
+            invalidated_reason TEXT DEFAULT NULL,
+            original_entry_low REAL DEFAULT NULL,
+            original_entry_high REAL DEFAULT NULL,
+            zone_source TEXT DEFAULT 'OB',
+            zone_refined_count INTEGER DEFAULT 0,
+            closest_approach_price REAL DEFAULT NULL,
+            closest_approach_atr REAL DEFAULT NULL,
+            closest_approach_at TEXT DEFAULT NULL,
+            near_miss_count INTEGER DEFAULT 0,
+            last_checked_at TEXT DEFAULT NULL,
+            last_checked_price REAL DEFAULT NULL,
+            locked_win_probability REAL DEFAULT NULL,
+            locked_expected_value REAL DEFAULT NULL,
+            locked_confluence REAL DEFAULT NULL,
+            locked_at TEXT DEFAULT NULL
         )''')
-        c.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_active_thesis_asset_mode
-            ON active_thesis(asset, mode)
+        
+        c.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_active_thesis_asset_mode 
+            ON active_thesis(asset, mode) 
             WHERE status = 'ACTIVE' ''')
-            
-        # v16: extend active_thesis with zone-refinement and proximity tracking
-        existing_thesis_cols = [row[1] for row in c.execute("PRAGMA table_info(active_thesis)").fetchall()]
-        new_thesis_cols = {
-            'original_entry_low':       'REAL DEFAULT NULL',   # the FIRST zone ever set — never overwritten
-            'original_entry_high':      'REAL DEFAULT NULL',
-            'zone_source':              "TEXT DEFAULT 'OB'",    # 'OB' | 'FVG' | 'IFVG' — what kind of zone is currently active
-            'zone_refined_count':       'INTEGER DEFAULT 0',    # how many times the trigger zone has been refined to a fresher FVG/iFVG
-            'closest_approach_price':   'REAL DEFAULT NULL',    # closest price has come to the CURRENT zone, ever
-            'closest_approach_atr':     'REAL DEFAULT NULL',    # that distance expressed in ATR units
-            'closest_approach_at':      'TEXT DEFAULT NULL',    # timestamp of the closest approach
-            'near_miss_count':          'INTEGER DEFAULT 0',    # how many times price approached within tolerance then reversed away
-            'last_checked_at':          'TEXT DEFAULT NULL',
-            'last_checked_price':       'REAL DEFAULT NULL',
-        }
-        for col, coltype in new_thesis_cols.items():
-            if col not in existing_thesis_cols:
-                try:
-                    c.execute(f'ALTER TABLE active_thesis ADD COLUMN {col} {coltype}')
-                except Exception:
-                    pass
 
-        # v16.1: lock confidence/EV at thesis CREATION time, separate from
-        # whatever this run's fresh recalculation produces
-        existing_thesis_cols_v161 = [row[1] for row in c.execute("PRAGMA table_info(active_thesis)").fetchall()]
-        new_thesis_cols_v161 = {
-            'locked_win_probability': 'REAL DEFAULT NULL',
-            'locked_expected_value':  'REAL DEFAULT NULL',
-            'locked_confluence':      'REAL DEFAULT NULL',
-            'locked_at':              'TEXT DEFAULT NULL',
-        }
-        for col, coltype in new_thesis_cols_v161.items():
-            if col not in existing_thesis_cols_v161:
-                try:
-                    c.execute(f'ALTER TABLE active_thesis ADD COLUMN {col} {coltype}')
-                except Exception:
-                    pass
         conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error initializing DB: {e}")
         conn.close()
     except Exception as e:
         print(f'ERROR: Could not initialize database: {e}', file=sys.stderr)
@@ -672,11 +639,11 @@ def _find_open_signal(asset, mode):
     consistent with how outcomes are tracked elsewhere in the system.
     """
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         row = c.execute('''SELECT id, entry_low, entry_high, sl, tp1, verdict, notes
                            FROM signals
-                           WHERE asset=? AND mode=? AND outcome IS NULL
+                           WHERE asset=%s AND mode=%s AND outcome IS NULL
                            AND verdict IN ('EXECUTE', 'EXECUTE_WITH_CAUTION', 'EXECUTE WITH CAUTION')
                            AND entry_low IS NOT NULL AND sl IS NOT NULL AND tp1 IS NOT NULL
                            ORDER BY id DESC LIMIT 1''', (asset, mode)).fetchone()
@@ -715,7 +682,7 @@ def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl
     """
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
 
         # v14: Only run duplicate/supersede logic for actual trades
@@ -746,7 +713,7 @@ def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl
                     else:
                         reconfirm_count = 2  # this confirmation is the 2nd observation of the same setup
                     new_notes = f'Re-confirmed {reconfirm_count} times (last: {now}). Setup unchanged since first detection.'
-                    c.execute('UPDATE signals SET notes=? WHERE id=?', (new_notes, existing['id']))
+                    c.execute('UPDATE signals SET notes=%s WHERE id=%s', (new_notes, existing['id']))
                     conn.commit()
                     conn.close()
                     return {'id': existing['id'], 'was_reconfirmation': True, 'superseded_id': None}
@@ -754,8 +721,8 @@ def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl
                     # Genuinely new setup — close out the old open row as SUPERSEDED,
                     # not as a win/loss it never actually achieved
                     now = datetime.now(timezone.utc).isoformat()
-                    c.execute('''UPDATE signals SET outcome='SUPERSEDED', outcome_checked_at=?,
-                                 notes=? WHERE id=?''',
+                    c.execute('''UPDATE signals SET outcome='SUPERSEDED', outcome_checked_at=%s,
+                                 notes=%s WHERE id=%s''',
                               (now, f'Superseded by a new signal at {now} before TP/SL resolved.', existing['id']))
                     superseded_id = existing['id']
 
@@ -769,7 +736,7 @@ def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl
              rsi_htf, atr, regime, session, verdict, current_price_at_signal,
              win_probability_pct, expected_value_r, hard_block_reason, wait_reason,
              notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
             (asset, mode, datetime.now(timezone.utc).isoformat(),
              direction, entry_low, entry_high, tp1, tp2, tp3, sl,
              score, htf_trend, etf_trend, rsi_htf, atr, regime, session,
@@ -789,7 +756,7 @@ def get_active_thesis(asset, mode):
     """Returns the current active thesis for this asset+mode, or None."""
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('''SELECT id, direction, status, created_at, updated_at,
                      confluence_score, htf_trend, etf_trend,
@@ -797,7 +764,7 @@ def get_active_thesis(asset, mode):
                      invalidation_price, invalidation_reason, structural_anchor,
                      times_confirmed
                      FROM active_thesis
-                     WHERE asset=? AND mode=? AND status='ACTIVE'
+                     WHERE asset=%s AND mode=%s AND status='ACTIVE'
                      ORDER BY id DESC LIMIT 1''', (asset, mode))
         row = c.fetchone()
         conn.close()
@@ -827,12 +794,12 @@ def create_thesis(asset, mode, direction, confluence_score, htf_trend, etf_trend
     """
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         now = datetime.now(timezone.utc).isoformat()
         c.execute('''UPDATE active_thesis SET status='REPLACED',
-                     invalidated_at=?, invalidated_reason='New thesis superseded this one'
-                     WHERE asset=? AND mode=? AND status='ACTIVE' ''', (now, asset, mode))
+                     invalidated_at=%s, invalidated_reason='New thesis superseded this one'
+                     WHERE asset=%s AND mode=%s AND status='ACTIVE' ''', (now, asset, mode))
         c.execute('''INSERT INTO active_thesis
             (asset, mode, direction, status, created_at, updated_at,
              confluence_score, htf_trend, etf_trend,
@@ -841,7 +808,7 @@ def create_thesis(asset, mode, direction, confluence_score, htf_trend, etf_trend
              original_entry_low, original_entry_high, zone_source, zone_refined_count,
              last_checked_at, last_checked_price,
              locked_win_probability, locked_expected_value, locked_confluence, locked_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,0,?,?,?,?,?,?)''',
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,0,%s,%s,%s,%s,%s,%s)''',
             (asset, mode, direction, 'ACTIVE', now, now,
              confluence_score, htf_trend, etf_trend,
              entry_low, entry_high, sl, tp1, tp2, tp3,
@@ -860,15 +827,15 @@ def create_thesis(asset, mode, direction, confluence_score, htf_trend, etf_trend
 def confirm_thesis(thesis_id, new_confluence_score=None):
     """Bumps the confirmation counter and updated_at timestamp — thesis remains unchanged."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         now = datetime.now(timezone.utc).isoformat()
         if new_confluence_score is not None:
-            c.execute('''UPDATE active_thesis SET updated_at=?, times_confirmed=times_confirmed+1,
-                         confluence_score=? WHERE id=?''', (now, new_confluence_score, thesis_id))
+            c.execute('''UPDATE active_thesis SET updated_at=%s, times_confirmed=times_confirmed+1,
+                         confluence_score=%s WHERE id=%s''', (now, new_confluence_score, thesis_id))
         else:
-            c.execute('''UPDATE active_thesis SET updated_at=?, times_confirmed=times_confirmed+1
-                         WHERE id=?''', (now, thesis_id))
+            c.execute('''UPDATE active_thesis SET updated_at=%s, times_confirmed=times_confirmed+1
+                         WHERE id=%s''', (now, thesis_id))
         conn.commit()
         conn.close()
         return True
@@ -879,11 +846,11 @@ def confirm_thesis(thesis_id, new_confluence_score=None):
 def invalidate_thesis(thesis_id, reason):
     """Marks a thesis as invalidated with the structural reason."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         now = datetime.now(timezone.utc).isoformat()
         c.execute('''UPDATE active_thesis SET status='INVALIDATED',
-                     invalidated_at=?, invalidated_reason=? WHERE id=?''',
+                     invalidated_at=%s, invalidated_reason=%s WHERE id=%s''',
                   (now, reason, thesis_id))
         conn.commit()
         conn.close()
@@ -972,22 +939,22 @@ def track_zone_proximity(thesis, current_price, atr, near_miss_threshold_atr=0.5
         event = 'NEW_CLOSEST_NOT_YET_NEAR'
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         now = datetime.now(timezone.utc).isoformat()
 
-        update_fields = ['last_checked_at=?', 'last_checked_price=?']
+        update_fields = ['last_checked_at=%s', 'last_checked_price=%s']
         update_values = [now, current_price]
 
         if is_new_closest:
-            update_fields += ['closest_approach_price=?', 'closest_approach_atr=?', 'closest_approach_at=?']
+            update_fields += ['closest_approach_price=%s', 'closest_approach_atr=%s', 'closest_approach_at=%s']
             update_values += [current_price, round(distance_atr, 3), now]
 
         if event == 'NEAR_MISS':
             update_fields.append('near_miss_count=near_miss_count+1')
 
         update_values.append(thesis['id'])
-        c.execute(f'''UPDATE active_thesis SET {", ".join(update_fields)} WHERE id=?''', update_values)
+        c.execute(f'''UPDATE active_thesis SET {", ".join(update_fields)} WHERE id=%s''', update_values)
         conn.commit()
         conn.close()
     except Exception:
@@ -1066,11 +1033,11 @@ def refine_thesis_zone(thesis, etf_data, htf_data, atr, max_refine_distance_atr=
         return thesis
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         now = datetime.now(timezone.utc).isoformat()
-        c.execute('''UPDATE active_thesis SET entry_low=?, entry_high=?, zone_source=?,
-                     zone_refined_count=zone_refined_count+1, updated_at=? WHERE id=?''',
+        c.execute('''UPDATE active_thesis SET entry_low=%s, entry_high=%s, zone_source=%s,
+                     zone_refined_count=zone_refined_count+1, updated_at=%s WHERE id=%s''',
                   (best['bottom'], best['top'],
                    f"FVG_REFINED_FROM_{best['source']}", now, thesis['id']))
         conn.commit()
@@ -1095,21 +1062,38 @@ def refine_thesis_zone(thesis, etf_data, htf_data, atr, max_refine_distance_atr=
 def fetch_current_price_deriv(asset):
     """
     Fetch current price AND recent candle data for outcome verification.
-    Returns dict with current_price and recent_candles (last 12 x 5min candles).
-    This allows the outcome checker to see if TP/SL was hit between checker runs.
+    Uses the local Node.js server proxy which handles WebSocket caching.
     """
-    DERIV_SYMBOLS = {
-        'XAUUSD': 'frxXAUUSD', 'XAGUSD': 'frxXAGUSD',
-        'EURUSD': 'frxEURUSD', 'GBPUSD': 'frxGBPUSD',
-        'USDJPY': 'frxUSDJPY', 'USDCHF': 'frxUSDCHF',
-        'AUDUSD': 'frxAUDUSD', 'USDCAD': 'frxUSDCAD',
-        'NZDUSD': 'frxNZDUSD',
-        'BTCUSD': 'cryBTCUSD', 'ETHUSD': 'cryETHUSD', 'SOLUSD': 'crySOLUSD',
-        'BOOM1000': 'BOOM1000', 'CRASH1000': 'CRASH1000',
-        'VOL75': 'R_75', 'VOL100': 'R_100',
-    }
-    symbol = DERIV_SYMBOLS.get(asset)
-    if not symbol:
+    try:
+        url = f'http://localhost:3000/api/candles?asset={asset}&granularity=300&count=288'
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            
+            if not data or len(data) == 0:
+                return None
+                
+            # data is a list of candles: {epoch, open, high, low, close, date}
+            # Deriv candles returned from our TS server have these keys.
+            current_price = data[-1]['close']
+            
+            # format for outcome checker
+            formatted_candles = []
+            for c in data[-12:]: # Last 12 candles = 1 hour
+                formatted_candles.append({
+                    'epoch': c['epoch'],
+                    'open': c['open'],
+                    'high': c['high'],
+                    'low': c['low'],
+                    'close': c['close']
+                })
+                
+            return {
+                'current_price': current_price,
+                'recent_candles': formatted_candles
+            }
+    except Exception as e:
+        print(f"Error fetching current price for {asset} from local API: {e}")
         return None
 
     # Fetch last 288 x 5-min candles (covers 24 hours of price history)
@@ -1178,7 +1162,7 @@ def check_and_update_outcomes(asset=None):
     """
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
 
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
@@ -1188,8 +1172,8 @@ def check_and_update_outcomes(asset=None):
                          tp1, sl, atr, timestamp, confluence_score
                          FROM signals
                          WHERE outcome IS NULL
-                         AND timestamp < ?
-                         AND asset = ?
+                         AND timestamp < %s
+                         AND asset = %s
                          ORDER BY timestamp ASC LIMIT 50''',
                       (cutoff, asset))
         else:
@@ -1197,7 +1181,7 @@ def check_and_update_outcomes(asset=None):
                          tp1, sl, atr, timestamp, confluence_score
                          FROM signals
                          WHERE outcome IS NULL
-                         AND timestamp < ?
+                         AND timestamp < %s
                          ORDER BY timestamp ASC LIMIT 50''',
                       (cutoff,))
 
@@ -1308,15 +1292,15 @@ def check_and_update_outcomes(asset=None):
                     note = f'Signal expired after {round(hours_open,1)}h. Exit at current price {current_price}.'
 
             if outcome:
-                conn2 = sqlite3.connect(DB_PATH)
+                conn2 = get_db_connection()
                 c2 = conn2.cursor()
                 c2.execute('''UPDATE signals SET
-                    outcome = ?,
-                    outcome_checked_at = ?,
-                    exit_price = ?,
-                    pnl_atr = ?,
-                    notes = ?
-                    WHERE id = ?''',
+                    outcome = %s,
+                    outcome_checked_at = %s,
+                    exit_price = %s,
+                    pnl_atr = %s,
+                    notes = %s
+                    WHERE id = %s''',
                     (outcome,
                      datetime.now(timezone.utc).isoformat(),
                      exit_price, pnl_atr, note, sig_id))
@@ -1346,12 +1330,12 @@ def check_and_update_outcomes(asset=None):
         if assets_to_retrain:
             try:
                 today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-                conn_dp = sqlite3.connect(DB_PATH)
+                conn_dp = get_db_connection()
                 c_dp    = conn_dp.cursor()
                 for dp_asset in assets_to_retrain:
                     c_dp.execute('''SELECT COUNT(*), SUM(CASE WHEN outcome="WIN" THEN 1 ELSE 0 END),
                                     SUM(CASE WHEN outcome="LOSS" THEN 1 ELSE 0 END), SUM(pnl_atr)
-                                    FROM signals WHERE asset=? AND date(outcome_checked_at)=?''',
+                                    FROM signals WHERE asset=%s AND date(outcome_checked_at)=%s''',
                                  (dp_asset, today))
                     row = c_dp.fetchone()
                     if row and row[0] > 0:
@@ -1359,8 +1343,8 @@ def check_and_update_outcomes(asset=None):
                         wr = round(wins/total*100, 1) if total else None
                         c_dp.execute('''INSERT INTO daily_performance
                             (date, asset, trades, wins, losses, pnl_atr, win_rate)
-                            VALUES (?,?,?,?,?,?,?)
-                            ON CONFLICT DO NOTHING''',
+                            VALUES (%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (date, asset) DO NOTHING''',
                             (today, dp_asset, total, wins or 0, losses or 0, pnl or 0, wr))
                 conn_dp.commit()
                 conn_dp.close()
@@ -1389,7 +1373,7 @@ def check_wait_avoid_outcomes(asset=None, candles_by_tf=None, hours_lookback=48)
     price actually did afterward. This answers the core question: was the
     caution justified (price never reached the zone, or reversed away from
     it) or was it a missed opportunity (price reached the stated entry zone
-    and would have hit TP1 before SL)?
+    and would have hit TP1 before SL)%s
 
     This requires fresh candle data to be passed in (candles_by_tf) since
     Python doesn't independently fetch market data — server.ts supplies it,
@@ -1408,7 +1392,7 @@ def check_wait_avoid_outcomes(asset=None, candles_by_tf=None, hours_lookback=48)
     """
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
 
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_lookback)).isoformat()
@@ -1417,12 +1401,13 @@ def check_wait_avoid_outcomes(asset=None, candles_by_tf=None, hours_lookback=48)
                    FROM signals
                    WHERE verdict IN ('WAIT','AVOID')
                      AND outcome IS NULL
-                     AND timestamp > ?'''
+                     AND timestamp > %s'''
         params = [cutoff]
         if asset:
-            query += ' AND asset = ?'
+            query += ' AND asset = %s'
             params.append(asset)
-        rows = c.execute(query, params).fetchall()
+        c.execute(query, params)
+        rows = c.fetchall()
 
         results = []
         for row in rows:
@@ -1432,7 +1417,7 @@ def check_wait_avoid_outcomes(asset=None, candles_by_tf=None, hours_lookback=48)
             # can't be judged the same way — mark as justified by default
             # since there was no specific zone to have reached
             if entry_low is None or tp1 is None or sl is None:
-                c.execute('UPDATE signals SET outcome=?, outcome_checked_at=? WHERE id=?',
+                c.execute('UPDATE signals SET outcome=%s, outcome_checked_at=%s WHERE id=%s',
                           ('CAUTION_JUSTIFIED', datetime.now(timezone.utc).isoformat(), sig_id))
                 results.append({'id': sig_id, 'outcome': 'CAUTION_JUSTIFIED', 'note': 'No specific entry zone was stated.'})
                 continue
@@ -1491,7 +1476,7 @@ def check_wait_avoid_outcomes(asset=None, candles_by_tf=None, hours_lookback=48)
                 note = 'Price reached the zone but has not yet resolved toward TP1 or SL.'
 
             if outcome != 'PENDING':
-                c.execute('UPDATE signals SET outcome=?, outcome_checked_at=? WHERE id=?',
+                c.execute('UPDATE signals SET outcome=%s, outcome_checked_at=%s WHERE id=%s',
                           (outcome, datetime.now(timezone.utc).isoformat(), sig_id))
 
             results.append({'id': sig_id, 'outcome': outcome, 'note': note})
@@ -1516,7 +1501,7 @@ def export_signals_csv(asset=None, limit=1000):
     """
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         query = '''SELECT id, asset, mode, timestamp, verdict, direction,
                           entry_low, entry_high, tp1, tp2, tp3, sl,
@@ -1527,12 +1512,13 @@ def export_signals_csv(asset=None, limit=1000):
                    FROM signals'''
         params = []
         if asset:
-            query += ' WHERE asset = ?'
+            query += ' WHERE asset = %s'
             params.append(asset)
-        query += ' ORDER BY timestamp DESC LIMIT ?'
+        query += ' ORDER BY timestamp DESC LIMIT %s'
         params.append(limit)
 
-        rows = c.execute(query, params).fetchall()
+        c.execute(query, params)
+        rows = c.fetchall()
         col_names = [d[0] for d in c.description]
         conn.close()
 
@@ -1557,14 +1543,14 @@ def update_adaptive_weights(asset):
         if len(outcomes) < 50:
             return  # not enough data yet
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
 
         # Get all real outcomes with full signal data
         c.execute('''SELECT confluence_score, outcome, pnl_atr, rsi_htf,
                      htf_trend, etf_trend, atr, regime, session
                      FROM signals
-                     WHERE asset = ? AND outcome IN ('WIN','LOSS')
+                     WHERE asset = %s AND outcome IN ('WIN','LOSS')
                      ORDER BY id DESC LIMIT 200''', (asset,))
         rows = c.fetchall()
         conn.close()
@@ -1639,12 +1625,12 @@ def update_adaptive_weights(asset):
             'w_session':   session_weight,
         }
 
-        conn3 = sqlite3.connect(DB_PATH)
+        conn3 = get_db_connection()
         c3 = conn3.cursor()
         c3.execute('''INSERT INTO asset_weights
             (asset, w_structure, w_liquidity, w_choch, w_ob, w_fvg,
              w_sd, w_pd, w_pa, w_session, total_trades, win_rate, last_updated)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT(asset) DO UPDATE SET
             w_structure=excluded.w_structure,
             w_liquidity=excluded.w_liquidity,
@@ -1678,7 +1664,7 @@ def get_signal_dashboard(asset=None, limit=50):
     """
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
 
         if asset:
@@ -1687,8 +1673,8 @@ def get_signal_dashboard(asset=None, limit=50):
                          outcome, pnl_atr, exit_price, notes, regime, session,
                          verdict, current_price_at_signal, win_probability_pct,
                          expected_value_r, hard_block_reason, wait_reason
-                         FROM signals WHERE asset = ?
-                         ORDER BY id DESC LIMIT ?''', (asset, limit))
+                         FROM signals WHERE asset = %s
+                         ORDER BY id DESC LIMIT %s''', (asset, limit))
         else:
             c.execute('''SELECT id, asset, mode, timestamp, direction,
                          entry_low, entry_high, tp1, sl, confluence_score,
@@ -1696,7 +1682,7 @@ def get_signal_dashboard(asset=None, limit=50):
                          verdict, current_price_at_signal, win_probability_pct,
                          expected_value_r, hard_block_reason, wait_reason
                          FROM signals
-                         ORDER BY id DESC LIMIT ?''', (limit,))
+                         ORDER BY id DESC LIMIT %s''', (limit,))
 
         rows = c.fetchall()
 
@@ -1705,7 +1691,7 @@ def get_signal_dashboard(asset=None, limit=50):
             c.execute('''SELECT COUNT(*), SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END),
                          SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END),
                          AVG(pnl_atr), SUM(pnl_atr)
-                         FROM signals WHERE asset=? AND outcome IN ('WIN','LOSS')''', (asset,))
+                         FROM signals WHERE asset=%s AND outcome IN ('WIN','LOSS')''', (asset,))
         else:
             c.execute('''SELECT COUNT(*), SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END),
                          SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END),
@@ -1751,11 +1737,11 @@ def get_signal_dashboard(asset=None, limit=50):
 
         # Fetch daily performance
         try:
-            conn_dp = sqlite3.connect(DB_PATH)
+            conn_dp = get_db_connection()
             c_dp    = conn_dp.cursor()
             if asset:
                 c_dp.execute('''SELECT date, trades, wins, losses, pnl_atr, win_rate
-                                FROM daily_performance WHERE asset=?
+                                FROM daily_performance WHERE asset=%s
                                 ORDER BY date DESC LIMIT 30''', (asset,))
             else:
                 c_dp.execute('''SELECT date, SUM(trades), SUM(wins), SUM(losses), SUM(pnl_atr), NULL
@@ -1801,10 +1787,10 @@ def get_real_outcomes(asset):
     """Get historical signal outcomes for this asset from database."""
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('''SELECT confluence_score, outcome, pnl_atr, rsi_htf, htf_trend
-                     FROM signals WHERE asset=? AND outcome IS NOT NULL
+                     FROM signals WHERE asset=%s AND outcome IS NOT NULL
                      ORDER BY id DESC LIMIT 200''', (asset,))
         rows = c.fetchall()
         conn.close()
@@ -1817,9 +1803,9 @@ def get_asset_weights(asset):
     """Get adaptive weights for this asset, or defaults if not enough data."""
     try:
         init_db()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute('SELECT * FROM asset_weights WHERE asset=?', (asset,))
+        c.execute('SELECT * FROM asset_weights WHERE asset=%s', (asset,))
         row = c.fetchone()
         conn.close()
         if row and row[10] >= 50:  # total_trades >= 50
@@ -2093,7 +2079,7 @@ def assess_event_positioning(economic_events: list, htf_trend: str,
     - It identifies the nearest POSITIONING_WINDOW event
     - It states what the structure/trend has done in the days leading up
     - It flags whether the consensus forecast implies a directional bias
-      (e.g. GDP consensus 1.6% vs previous — slowing or accelerating?)
+      (e.g. GDP consensus 1.6% vs previous — slowing or accelerating%s)
     - It hands all of this to the AI to interpret, exactly like every
       other evidence package in this system
 
@@ -6633,11 +6619,11 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
                 if prioritized['dist_atr'] < current_dist - 0.15:  # meaningful improvement, not noise
                     old_zone_desc = f"{existing_thesis.get('entry_low')}-{existing_thesis.get('entry_high')} (originally identified)"
                     try:
-                        conn = sqlite3.connect(DB_PATH)
+                        conn = get_db_connection()
                         c = conn.cursor()
                         now = datetime.now(timezone.utc).isoformat()
-                        c.execute('''UPDATE active_thesis SET entry_low=?, entry_high=?, zone_source=?,
-                                     zone_refined_count=zone_refined_count+1, updated_at=? WHERE id=?''',
+                        c.execute('''UPDATE active_thesis SET entry_low=%s, entry_high=%s, zone_source=%s,
+                                     zone_refined_count=zone_refined_count+1, updated_at=%s WHERE id=%s''',
                                   (prioritized['bottom'], prioritized['top'],
                                    f"MTF_INTERCEPT_{prioritized['timeframe']}_{prioritized['type']}",
                                    now, existing_thesis['id']))
@@ -6768,9 +6754,9 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
     # locked EV from when THEY were created, and must not be overwritten)
     if 'new_thesis_id' in locals() and new_thesis_id:
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_connection()
             c = conn.cursor()
-            c.execute('UPDATE active_thesis SET locked_expected_value=? WHERE id=?',
+            c.execute('UPDATE active_thesis SET locked_expected_value=%s WHERE id=%s',
                       (trade_expectancy.get('expected_value_r'), new_thesis_id))
             conn.commit()
             conn.close()

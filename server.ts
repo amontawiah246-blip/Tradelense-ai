@@ -180,8 +180,8 @@ function fetchLiveTick(symbol: string): Promise<{ bid: number; ask: number; mid:
     const timeout = setTimeout(() => { ws.terminate(); resolve(null); }, 8000);
 
     ws.on('open', () => {
-      // Request a single tick (current price) — not historical candles
-      ws.send(JSON.stringify({ ticks: symbol, subscribe: 0 }));
+// Request single history tick instead of live subscription due to restriction
+      ws.send(JSON.stringify({ ticks_history: symbol, end: 'latest', count: 1, style: 'ticks' }));
     });
 
     ws.on('message', (raw: Buffer | string) => {
@@ -190,22 +190,19 @@ function fetchLiveTick(symbol: string): Promise<{ bid: number; ask: number; mid:
         clearTimeout(timeout);
         ws.close();
 
-        if (data.error || !data.tick) {
+        if (data.error || !data.history || !data.history.prices || data.history.prices.length === 0) {
           resolve(null);
           return;
         }
 
-        const tick = data.tick;
-        const bid  = parseFloat(tick.bid  ?? tick.quote ?? 0);
-        const ask  = parseFloat(tick.ask  ?? tick.quote ?? 0);
-        const mid  = ask > 0 && bid > 0 ? (bid + ask) / 2 : (tick.quote ? parseFloat(tick.quote) : 0);
-
+        const price = data.history.prices[0];
+        const epoch = data.history.times[0];
         resolve({
-          bid:    Math.round(bid  * 100000) / 100000,
-          ask:    Math.round(ask  * 100000) / 100000,
-          mid:    Math.round(mid  * 100000) / 100000,
-          epoch:  tick.epoch || Math.floor(Date.now() / 1000),
-          symbol: symbol,
+          bid: price,
+          ask: price, // ticks_history does not give spread
+          mid: price,
+          epoch: epoch,
+          symbol: symbol
         });
       } catch {
         resolve(null);
@@ -1821,7 +1818,7 @@ async function startServer() {
   });
 
   // v9 fix: Live price endpoint for dashboard instrument panel
-  app.get('/api/live-price', async (req, res) => {
+app.get('/api/live-price', async (req, res) => {
     const asset  = (req.query.asset as string || '').toUpperCase();
     const symbol = DERIV_SYMBOLS[asset];
     if (!symbol) return res.status(400).json({ error: 'Unknown asset' });
@@ -1835,11 +1832,24 @@ async function startServer() {
       ask:    tick.ask,
       mid:    tick.mid,
       epoch:  tick.epoch,
-      change: 0,  // change% requires prior close
+      change: 0
     });
   });
 
-  // Signal performance summary endpoint
+  app.get('/api/candles', async (req, res) => {
+    const asset = (req.query.asset as string || '').toUpperCase();
+    const granularity = parseInt(req.query.granularity as string) || 300;
+    const count = parseInt(req.query.count as string) || 288;
+    const symbol = DERIV_SYMBOLS[asset] || asset;
+    
+    try {
+      const candles = await fetchCachedCandles(symbol, granularity, count);
+      res.json(candles);
+    } catch(e:any) {
+      res.status(500).json({error: e.message});
+    }
+  });
+
   app.get('/api/performance', async(req,res) => {
     try {
       const asset  = req.query.asset as string | undefined;
