@@ -18,7 +18,7 @@ import {
 } from './ExtraModules';
 
 interface DashboardProps {
-  onAnalyze: (asset: string, mode: TradingMode, imageBase64?: string, accountSize?: number, riskPct?: number) => Promise<{ result: string; signalData?: any }>;
+  onAnalyze: (asset: string, mode: TradingMode, imageBase64?: string, accountSize?: number, riskPct?: number, newsUpdate?: string) => Promise<{ result: string; signalData?: any }>;
 }
 
 type TabType = 
@@ -312,6 +312,8 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
   // Form Configurations
   const [accountSize, setAccountSize] = useState<number>(10000);
   const [riskPct, setRiskPct] = useState<number>(1.0);
+  const [newsWireInput, setNewsWireInput] = useState<string>('');
+  const [showNewsWire, setShowNewsWire] = useState<boolean>(false);
 
   // Live prices mock database
   const [livePrices, setLivePrices] = useState<Record<string, { bid: number; ask: number; change: number; history: number[] }>>({});
@@ -500,7 +502,7 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
     setSignalData(null);
     setIsDropdownOpen(false);
     try {
-      const data = await onAnalyze(selectedAsset, mode, undefined, accountSize, riskPct);
+      const data = await onAnalyze(selectedAsset, mode, undefined, accountSize, riskPct, newsWireInput.trim() || undefined);
       setResult(data.result);
       setSignalData(data.signalData || null);
       setLastAnalysisCompletedAt(Date.now());
@@ -1079,6 +1081,62 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
                             {(activeLivePrice > 0 ? (activeLivePrice * 1.00015).toFixed(currentDecimals) : '—')}
                           </strong>
                         </div>
+                      </div>
+
+                      {/* NEWS WIRE & FUNDAMENTAL FLASH INPUT */}
+                      <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3.5 flex flex-col gap-2">
+                        <div className="flex items-center justify-between">
+                          <button
+                            type="button"
+                            onClick={() => setShowNewsWire(!showNewsWire)}
+                            className="flex items-center gap-2 text-xs font-bold text-slate-700 hover:text-orange-600 transition-colors cursor-pointer"
+                          >
+                            <Newspaper className="w-4 h-4 text-orange-500" />
+                            <span>Breaking News & Fundamental Flash</span>
+                            {newsWireInput.trim() ? (
+                              <span className="inline-flex items-center gap-1 text-[10px] font-sans font-bold bg-emerald-100 text-emerald-700 px-1.5 py-0.2 rounded-full">
+                                Active News Injected
+                              </span>
+                            ) : null}
+                            {showNewsWire ? <ChevronUp className="w-3.5 h-3.5 text-slate-400" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-400" />}
+                          </button>
+
+                          {showNewsWire && (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setNewsWireInput(`— news update —\n\nthe latest us employment data (non-farm payrolls) has just been released:\n• average hourly earnings m/m\nactual: 0.3% | forecast: 0.3% | previous: 0.1%\n• non-farm employment change\nactual: 162k | forecast: 55k | previous: 21k (revised)\n• unemployment rate\nactual: 4.1% | forecast: 4.1% | previous: 4.1%\n\nmarket insight:\nthe latest us labor market figures delivered a significant upside surprise, driven by a massive beating on non-farm employment change (162k actual vs 55k expected).`)}
+                                className="text-[10px] font-sans font-medium px-2 py-0.5 rounded bg-orange-100 text-orange-700 hover:bg-orange-200 transition-colors cursor-pointer"
+                              >
+                                Load NFP Release
+                              </button>
+                              {newsWireInput && (
+                                <button
+                                  type="button"
+                                  onClick={() => setNewsWireInput('')}
+                                  className="text-[10px] font-sans text-slate-400 hover:text-slate-600 px-1.5 py-0.5 cursor-pointer"
+                                >
+                                  Clear
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {showNewsWire && (
+                          <div className="flex flex-col gap-2 mt-1">
+                            <textarea
+                              value={newsWireInput}
+                              onChange={(e) => setNewsWireInput(e.target.value)}
+                              rows={3}
+                              placeholder="Paste or type breaking macro release (e.g. NFP 162k vs 55k forecast, CPI, Fed statement) to predict fundamental reaction & SMC market structure..."
+                              className="w-full text-xs font-sans p-2.5 rounded-lg border border-slate-200 bg-white focus:outline-none focus:ring-1 focus:ring-orange-400 text-slate-800 placeholder-slate-400 resize-none"
+                            />
+                            <p className="text-[10px] text-slate-500 font-sans">
+                              The AI will synthesize these actual release figures with multi-timeframe order flow, liquidity sweeps, and predict the market structure displacement.
+                            </p>
+                          </div>
+                        )}
                       </div>
 
                       {/* MAIN REQUEST TRIGGER BUTTON */}

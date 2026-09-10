@@ -2,7 +2,7 @@ import React from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
-import { ShieldAlert, BarChart2, TrendingUp, AlertTriangle, Clock } from 'lucide-react';
+import { ShieldAlert, BarChart2, TrendingUp, AlertTriangle, Clock, Compass } from 'lucide-react';
 import { motion } from 'motion/react';
 
 interface AnalysisResultProps {
@@ -47,16 +47,23 @@ export function AnalysisResult({ result, isLoading, statusMsg }: AnalysisResultP
                      result.includes('NO TRADE SETUP FOUND') ||
                      result.includes('VERDICT: BLOCK');
 
-  const isCaution = result.includes('VERDICT: EXECUTE WITH CAUTION') ||
-                    result.includes('**EXECUTE WITH CAUTION**') ||
-                    result.includes('EXECUTE_WITH_CAUTION');
+  const isCountertrend = !isRejected && (
+                         result.includes('COUNTERTREND SCALP') ||
+                         result.includes('COUNTERTREND') ||
+                         result.includes('Countertrend Scalp'));
 
-  const isExecute = !isCaution && (
+  const isCaution = !isRejected && !isCountertrend && (
+                    result.includes('VERDICT: EXECUTE WITH CAUTION') ||
+                    result.includes('**EXECUTE WITH CAUTION**') ||
+                    result.includes('EXECUTE_WITH_CAUTION'));
+
+  const isExecute = !isCaution && !isCountertrend && !isRejected && (
                     result.includes('VERDICT: EXECUTE') ||
                     result.includes('**EXECUTE**'));
 
-  const isWait = result.includes('VERDICT: WAIT') ||
-                 result.includes('**WAIT**');
+  const isWait = !isRejected && !isCaution && !isCountertrend && !isExecute && (
+                 result.includes('VERDICT: WAIT') ||
+                 result.includes('**WAIT**'));
 
   return (
     <motion.div 
@@ -69,9 +76,9 @@ export function AnalysisResult({ result, isLoading, statusMsg }: AnalysisResultP
         <div className="mb-6 p-4.5 bg-red-50 border border-red-200 rounded-2xl text-red-800 flex flex-col gap-2 text-left">
           <div className="flex items-center gap-2.5 font-bold tracking-wider uppercase text-xs text-red-700">
             <ShieldAlert className="w-4 h-4 text-red-600" />
-            <span>Execution Blocked</span>
+            <span>Tier 3: Execution Blocked (Genuine Hard Block)</span>
           </div>
-          <p className="text-xs text-red-700/90 font-medium leading-relaxed">Hard block condition present. Capital preservation engaged. See intelligence report below for details.</p>
+          <p className="text-xs text-red-700/90 font-medium leading-relaxed">Genuine hard block condition present. Capital preservation engaged. See intelligence report below for details.</p>
         </div>
       )}
 
@@ -79,29 +86,41 @@ export function AnalysisResult({ result, isLoading, statusMsg }: AnalysisResultP
         <div className="mb-6 p-4.5 bg-blue-50 border border-blue-200 rounded-2xl text-blue-800 flex flex-col gap-2 text-left">
           <div className="flex items-center gap-2.5 font-bold tracking-wider uppercase text-xs text-blue-700">
             <Clock className="w-4 h-4 text-blue-600" />
-            <span>Hold Position - Awaiting Confirmation</span>
+            <span>Hold Position — Awaiting Confirmation / Trigger</span>
           </div>
           <p className="text-xs text-blue-700/90 font-medium leading-relaxed">Setup is currently developing or requires confirmation. See parameters below.</p>
         </div>
       )}
 
-      {isCaution && !isRejected && !isWait && (
-        <div className="mb-6 p-4.5 bg-amber-50 border border-amber-200 rounded-2xl text-amber-800 flex flex-col gap-2 text-left">
-          <div className="flex items-center gap-2.5 font-bold tracking-wider uppercase text-xs text-amber-700">
-            <AlertTriangle className="w-4 h-4 text-amber-600" />
-            <span>Execute With Caution — 50% Sizing</span>
+      {isCountertrend && !isRejected && !isWait && (
+        <div className="mb-6 p-4.5 bg-indigo-50/80 border border-indigo-200 rounded-2xl text-indigo-900 flex flex-col gap-2 text-left shadow-sm">
+          <div className="flex items-center gap-2.5 font-bold tracking-wider uppercase text-xs text-indigo-700">
+            <Compass className="w-4 h-4 text-indigo-600" />
+            <span>Tier 2: Countertrend Scalp — Tactical 50% Sizing</span>
           </div>
-          <p className="text-xs text-amber-700/90 font-medium leading-relaxed">Valid setup with conflicting indicators. Reduce exposure and monitor key level exits.</p>
+          <p className="text-xs text-indigo-950 font-medium leading-relaxed">
+            LTF structural shift detected against HTF trend. Target first intermediate liquidity pool before opposing HTF zone. Move Stop Loss to Breakeven at TP1.
+          </p>
         </div>
       )}
 
-      {isExecute && !isRejected && !isCaution && !isWait && (
+      {isCaution && !isRejected && !isWait && !isCountertrend && (
+        <div className="mb-6 p-4.5 bg-amber-50 border border-amber-200 rounded-2xl text-amber-800 flex flex-col gap-2 text-left">
+          <div className="flex items-center gap-2.5 font-bold tracking-wider uppercase text-xs text-amber-700">
+            <AlertTriangle className="w-4 h-4 text-amber-600" />
+            <span>Tier 2: Execute With Caution — 50% Sizing</span>
+          </div>
+          <p className="text-xs text-amber-700/90 font-medium leading-relaxed">Valid setup with moderate headwinds. Reduce exposure and monitor key level exits.</p>
+        </div>
+      )}
+
+      {isExecute && !isRejected && !isCaution && !isCountertrend && !isWait && (
         <div className="mb-6 p-4.5 bg-emerald-50 border border-emerald-200 rounded-2xl text-emerald-800 flex flex-col gap-2 text-left shadow-sm">
           <div className="flex items-center gap-2.5 font-bold tracking-wider uppercase text-xs text-emerald-700">
             <TrendingUp className="w-4 h-4 text-emerald-600" />
-            <span>Execute — Standard Position Sizing</span>
+            <span>Tier 1: Execute — Standard Position Sizing</span>
           </div>
-          <p className="text-xs text-emerald-700/90 font-medium leading-relaxed">Evidence aligned. Standard positioning model parameters apply.</p>
+          <p className="text-xs text-emerald-700/90 font-medium leading-relaxed">Evidence aligned across timeframes. Standard positioning model parameters apply.</p>
         </div>
       )}
 

@@ -62,11 +62,15 @@ except ImportError:
 def get_db_connection():
     import psycopg2
     import os
+    host = os.environ.get('SQL_HOST') or '/app/cloudsql'
+    if os.path.exists('/app/cloudsql') and not os.environ.get('SQL_HOST'):
+        host = '/app/cloudsql'
     return psycopg2.connect(
-        host=os.environ.get('SQL_HOST'),
-        dbname=os.environ.get('SQL_DB_NAME'),
-        user=os.environ.get('SQL_ADMIN_USER'),
-        password=os.environ.get('SQL_ADMIN_PASSWORD')
+        host=host,
+        dbname=os.environ.get('SQL_DB_NAME') or 'postgres',
+        user=os.environ.get('SQL_ADMIN_USER') or 'postgres',
+        password=os.environ.get('SQL_ADMIN_PASSWORD') or '',
+        connect_timeout=3
     )
 
 
@@ -113,43 +117,57 @@ def fetch_fundamental_data(asset: str, calendar_data: dict, cross_asset_data: di
 
             # Calculate surprise direction (Python just measures, AI interprets)
             surprise_dir = 'PENDING'
-            if actual != 'Pending' and forecast != 'N/A':
+            if actual != 'Pending' and forecast != 'N/A' and actual and forecast:
                 try:
-                    act_val  = float(str(actual).replace('%','').replace('K','000').replace('M','000000'))
-                    fore_val = float(str(forecast).replace('%','').replace('K','000').replace('M','000000'))
-                    if act_val > fore_val:
-                        surprise_dir = 'BEAT'      # actual better than forecast
-                    elif act_val < fore_val:
-                        surprise_dir = 'MISS'      # actual worse than forecast
-                    else:
+                    def parse_val(v):
+                        s = str(v).replace('%','').replace('K','000').replace('k','000').replace('M','000000').replace('m','000000').replace('+','').strip()
+                        return float(s)
+                    act_val  = parse_val(actual)
+                    fore_val = parse_val(forecast)
+                    diff = act_val - fore_val
+                    pct_diff = (diff / abs(fore_val)) if fore_val != 0 else 0
+                    if abs(diff) < 0.001:
                         surprise_dir = 'IN_LINE'
+                    elif diff > 0:
+                        surprise_dir = 'BEAT (BLOWOUT)' if pct_diff > 0.5 else 'BEAT'
+                    else:
+                        surprise_dir = 'MISS (SHARP)' if pct_diff < -0.5 else 'MISS'
                 except (ValueError, TypeError):
                     surprise_dir = 'UNKNOWN'
 
             minutes_away = event.get('minutes_away', 9999)
             days_away    = round(minutes_away / 1440, 1)  # 1440 min = 1 day
 
-            # ── Time-bucket classification (this is the missing piece) ───────
-            # This determines HOW the AI should treat the event — not just
-            # whether to ignore it, but whether it's a positioning opportunity.
-            if minutes_away < -30:
+            # ── Time-bucket classification ────────────────────────────────────
+            # Events released within the last 120 minutes are NOT passed — they are in the
+            # post-news volatility and institutional liquidity sweep reaction phase!
+            if minutes_away < -120:
                 time_bucket = 'PASSED'
-            elif -30 <= minutes_away <= 30:
+                status = 'PASSED'
+            elif -120 <= minutes_away < 0:
+                time_bucket = 'POST_RELEASE_REACTION'
+                status = 'JUST_RELEASED'
+            elif 0 <= minutes_away <= 30:
                 time_bucket = 'IMMEDIATE_BLOCK'      # true hard block zone
+                status = 'IMMINENT'
             elif 30 < minutes_away <= 120:
                 time_bucket = 'NEAR_TERM_CAUTION'    # reduce size, don't block
+                status = 'NEAR_TERM'
             elif 120 < minutes_away <= 1440:
                 time_bucket = 'SAME_DAY_AWARENESS'   # event today, hours away
+                status = 'UPCOMING'
             elif 1440 < minutes_away <= 4320:
                 time_bucket = 'POSITIONING_WINDOW'   # 1-3 days: pre-event positioning territory
+                status = 'UPCOMING'
             else:
                 time_bucket = 'DISTANT_NO_IMPACT'    # >3 days: no bearing on a scalp/swing decision today
+                status = 'UPCOMING'
 
             event_data = {
                 'title':        event.get('title', 'Unknown'),
                 'currency':     event.get('currency', ''),
                 'time_utc':     event.get('time_utc', ''),
-                'status':       event.get('status', ''),
+                'status':       status,
                 'actual':       actual,
                 'forecast':     forecast,
                 'previous':     previous,
@@ -163,13 +181,14 @@ def fetch_fundamental_data(asset: str, calendar_data: dict, cross_asset_data: di
             fundamental['economic_events'].append(event_data)
 
             # Flag surprises for AI attention
-            if surprise_dir in ('BEAT', 'MISS'):
+            if 'BEAT' in surprise_dir or 'MISS' in surprise_dir or surprise_dir == 'IN_LINE':
                 fundamental['surprises'].append({
                     'event':    event.get('title', ''),
                     'currency': event.get('currency', ''),
                     'surprise': surprise_dir,
                     'actual':   actual,
                     'forecast': forecast,
+                    'previous': previous,
                 })
 
     # ── DXY / Dollar Environment ───────────────────────────────────────────────
@@ -596,7 +615,7 @@ def init_db():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Error initializing DB: {e}")
+        print(f"Error initializing DB: {e}", file=sys.stderr)
         conn.close()
     except Exception as e:
         print(f'ERROR: Could not initialize database: {e}', file=sys.stderr)
@@ -1093,7 +1112,7 @@ def fetch_current_price_deriv(asset):
                 'recent_candles': formatted_candles
             }
     except Exception as e:
-        print(f"Error fetching current price for {asset} from local API: {e}")
+        print(f"Error fetching current price for {asset} from local API: {e}", file=sys.stderr)
         return None
 
     # Fetch last 288 x 5-min candles (covers 24 hours of price history)
@@ -1790,7 +1809,7 @@ def get_real_outcomes(asset):
         conn = get_db_connection()
         c = conn.cursor()
         c.execute('''SELECT confluence_score, outcome, pnl_atr, rsi_htf, htf_trend
-                     FROM signals WHERE asset=%s AND outcome IS NOT NULL
+                     FROM signals WHERE asset=%s AND outcome IN ('WIN', 'LOSS')
                      ORDER BY id DESC LIMIT 200''', (asset,))
         rows = c.fetchall()
         conn.close()
@@ -1965,10 +1984,32 @@ def fetch_economic_calendar(asset):
         return _calendar_cache[cache_key]
 
     try:
-        url = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
-        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urlopen(req, timeout=8) as resp:
-            events = json.loads(resp.read().decode())
+        events = None
+        # Attempt network fetch from ForexFactory
+        try:
+            url = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
+            req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    events = json.loads(resp.read().decode())
+                    try:
+                        with open('/tmp/ff_calendar_cache.json', 'w') as f:
+                            json.dump(events, f)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Fallback to local persistent cache if network 429s or fails
+        if not events and os.path.exists('/tmp/ff_calendar_cache.json'):
+            try:
+                with open('/tmp/ff_calendar_cache.json', 'r') as f:
+                    events = json.load(f)
+            except Exception:
+                pass
+
+        if not events:
+            raise Exception("No economic calendar data available from network or cache")
 
         currencies = CALENDAR_ASSET_CURRENCIES.get(asset, ['USD'])
         now        = datetime.now(timezone.utc)
@@ -1977,7 +2018,8 @@ def fetch_economic_calendar(asset):
         for ev in events:
             if ev.get('impact', '').lower() != 'high':
                 continue
-            if ev.get('currency', '') not in currencies:
+            ev_currency = ev.get('country') or ev.get('currency', '')
+            if ev_currency not in currencies:
                 continue
             try:
                 ev_time = datetime.fromisoformat(ev['date'].replace('Z', '+00:00'))
@@ -1986,39 +2028,36 @@ def fetch_economic_calendar(asset):
 
             minutes_away = (ev_time - now).total_seconds() / 60
 
-            # Fix: previous logic checked IMMINENT before JUST_RELEASED,
-            # which is fine, but the 120-minute IMMINENT window was too wide
-            # and didn't distinguish "30 min away" from "close to 2 hours away."
-            # Tightened to match the actual hard-block threshold used in the
-            # AI prompt (30 minutes), with a separate near-term caution band.
-            if minutes_away < -30:
+            # Accurate institutional classification:
+            # Events released within the last 120 minutes are in the critical post-news
+            # volatility, spread expansion, and liquidity sweep phase!
+            if minutes_away < -120:
                 ev_status = 'PASSED'
-            elif -30 <= minutes_away < 0:
+                time_bucket = 'PASSED'
+            elif -120 <= minutes_away < 0:
                 ev_status = 'JUST_RELEASED'
+                time_bucket = 'POST_RELEASE_REACTION'
             elif 0 <= minutes_away <= 30:
                 ev_status = 'IMMINENT'
-            elif 30 < minutes_away <= 120:
-                ev_status = 'NEAR_TERM'
-            else:
-                ev_status = 'UPCOMING'
-
-            days_away = round(minutes_away / 1440, 1)
-            if minutes_away < -30:
-                time_bucket = 'PASSED'
-            elif -30 <= minutes_away <= 30:
                 time_bucket = 'IMMEDIATE_BLOCK'
             elif 30 < minutes_away <= 120:
+                ev_status = 'NEAR_TERM'
                 time_bucket = 'NEAR_TERM_CAUTION'
             elif 120 < minutes_away <= 1440:
+                ev_status = 'UPCOMING'
                 time_bucket = 'SAME_DAY_AWARENESS'
             elif 1440 < minutes_away <= 4320:
+                ev_status = 'UPCOMING'
                 time_bucket = 'POSITIONING_WINDOW'
             else:
+                ev_status = 'UPCOMING'
                 time_bucket = 'DISTANT_NO_IMPACT'
+
+            days_away = round(minutes_away / 1440, 1)
 
             relevant.append({
                 'title':        ev.get('title', 'Unknown Event'),
-                'currency':     ev.get('currency', ''),
+                'currency':     ev_currency,
                 'time_utc':     ev_time.strftime('%Y-%m-%d %H:%M UTC'),
                 'minutes_away': round(minutes_away),
                 'days_away':    days_away,
@@ -2031,22 +2070,24 @@ def fetch_economic_calendar(asset):
 
         relevant.sort(key=lambda x: abs(x['minutes_away']))
 
-        hard_pause    = any(e['status'] in ('IMMINENT', 'JUST_RELEASED') for e in relevant)
-        pause_reason  = None
+        hard_pause          = any(e['status'] == 'IMMINENT' for e in relevant)
+        post_release_active = any(e['status'] == 'JUST_RELEASED' for e in relevant)
+        pause_reason        = None
         for e in relevant:
             if e['status'] == 'IMMINENT':
-                pause_reason = f"{e['title']} ({e['currency']}) in {e['minutes_away']} minutes at {e['time_utc']}"
+                pause_reason = f"{e['title']} ({e['currency']}) in {e['minutes_away']} minutes at {e['time_utc']} — IMMINENT HARD BLOCK"
                 break
             elif e['status'] == 'JUST_RELEASED':
-                pause_reason = f"{e['title']} ({e['currency']}) released {abs(e['minutes_away'])} minutes ago — spreads may be elevated"
+                pause_reason = f"{e['title']} ({e['currency']}) released {abs(e['minutes_away'])} minutes ago — post-release volatility & liquidity sweep active"
                 break
 
         result = {
-            'status':            'OK',
-            'hard_pause':        hard_pause,
-            'pause_reason':      pause_reason,
-            'events':            relevant[:5],      # top-5 nearest, for the existing display block
-            'events_full':       relevant,           # FULL list, for positioning-window detection
+            'status':              'OK',
+            'hard_pause':          hard_pause,
+            'post_release_active': post_release_active,
+            'pause_reason':        pause_reason,
+            'events':              relevant[:5],      # top-5 nearest, for display
+            'events_full':         relevant,           # FULL list, for positioning-window detection
         }
         _calendar_cache[cache_key] = result
         _calendar_cache_time[cache_key] = now_ts
@@ -6346,6 +6387,69 @@ def calc_trigger_proximity(current_price: float, entry_zone_low: float,
     }
 
 
+
+def get_institutional_flow(symbol: str) -> dict:
+    import urllib.request
+    import json
+    crypto_symbols = {'BTCUSD', 'ETHUSD', 'SOLUSD', 'BNBUSD', 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'}
+    
+    binance_symbol = symbol.replace('USD', 'USDT')
+    if symbol not in crypto_symbols and binance_symbol not in crypto_symbols:
+        return {'available': False, 'reason': 'not a crypto asset'}
+        
+    try:
+        agg_url = f"https://api.binance.com/api/v3/aggTrades?symbol={binance_symbol}&limit=1000"
+        req = urllib.request.Request(agg_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            trades = json.loads(response.read().decode())
+        
+        buy_volume_usd = 0.0
+        sell_volume_usd = 0.0
+        for t in trades:
+            notional = float(t['p']) * float(t['q'])
+            if t['m']:
+                sell_volume_usd += notional
+            else:
+                buy_volume_usd += notional
+                
+        net_delta_usd = buy_volume_usd - sell_volume_usd
+        total_vol = buy_volume_usd + sell_volume_usd
+        delta_pct = (net_delta_usd / total_vol) * 100 if total_vol > 0 else 0
+        
+        depth_url = f"https://api.binance.com/api/v3/depth?symbol={binance_symbol}&limit=20"
+        req2 = urllib.request.Request(depth_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req2, timeout=5) as response2:
+            depth = json.loads(response2.read().decode())
+        
+        bid_notional = sum(float(p) * float(q) for p, q in depth['bids'])
+        ask_notional = sum(float(p) * float(q) for p, q in depth['asks'])
+        
+        imbalance_ratio = bid_notional / ask_notional if ask_notional > 0 else 1.0
+        
+        if imbalance_ratio > 1.15:
+            book_bias = "BUY_HEAVY"
+        elif imbalance_ratio < 0.87:
+            book_bias = "SELL_HEAVY"
+        else:
+            book_bias = "BALANCED"
+            
+        trade_bias = "BUY_HEAVY" if net_delta_usd > 0 else "SELL_HEAVY"
+        aligned = (trade_bias == book_bias and book_bias != "BALANCED")
+        
+        return {
+            'buy_volume_usd': buy_volume_usd,
+            'sell_volume_usd': sell_volume_usd,
+            'net_delta_usd': net_delta_usd,
+            'delta_pct': delta_pct,
+            'book_bias': book_bias,
+            'imbalance_ratio': imbalance_ratio,
+            'aligned': aligned,
+            'direction': "BULLISH" if trade_bias == "BUY_HEAVY" else "BEARISH",
+            'available': True
+        }
+    except Exception as e:
+        return {'available': False, 'error': str(e)}
+
 def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
                live_mid_price=None, live_bid=None, live_ask=None, live_tick_epoch=None):
     result={}
@@ -6561,6 +6665,35 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
     # v16.1: Calculate this run's FRESH numbers first — these represent
     # "what does a contextless read say right now" and are ALWAYS computed,
     # but they are no longer the only number reported once a thesis exists.
+
+    institutional_flow = get_institutional_flow(asset)
+    
+    # Store existing thesis before manipulating fresh_confluence to avoid unbound errors
+    mode_label = 'SCALPING MODE' if etf in ('5M', '15M') and htf in ('4H', '1H') else 'SWING MODE'
+    existing_thesis = get_active_thesis(asset, mode_label)
+    
+    if existing_thesis:
+        engine_bias = existing_thesis['direction']
+    else:
+        qual_stages = ('IN_ZONE', 'APPROACHING_ZONE')
+        if pullback_type in ('DIP_BUY', 'RALLY_SELL') and pullback_stage in qual_stages:
+            engine_bias = 'BULLISH' if pullback_type == 'DIP_BUY' else 'BEARISH'
+        else:
+            engine_bias = result.get(etf, {}).get('trend', 'NEUTRAL')
+            
+    if institutional_flow.get('available') and institutional_flow.get('aligned'):
+        if institutional_flow.get('direction') == engine_bias:
+            institutional_flow['contradicts_bias'] = False
+            confluence_score += 5
+        else:
+            institutional_flow['contradicts_bias'] = True
+            confluence_score -= 5
+    else:
+        if isinstance(institutional_flow, dict):
+            institutional_flow['contradicts_bias'] = False
+
+    if ml_score: ml_score['score'] = confluence_score
+
     fresh_win_probability = calc_win_probability(
         confluence_score, asset, etf_regime, session.get('session','UNKNOWN'),
         rsi_htf, real_outcomes,
@@ -6732,9 +6865,9 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
 
     trade_expectancy = calc_trade_expectancy(
         win_probability=win_probability.get('win_pct', 50),
-        tp1_rr=max(0.5, tp1_rr),
-        tp2_rr=max(0.5, tp2_rr),
-        tp3_rr=max(0.5, tp3_rr),
+        tp1_rr=tp1_rr,
+        tp2_rr=tp2_rr,
+        tp3_rr=tp3_rr,
         sl_rr=1.0
     )
     # FIXED: Expose which RR source was used so a low EV at high win-prob is explainable,
@@ -6939,6 +7072,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         ),
         'ml_score':        ml_score,
         'calendar':        calendar,
+        'institutional_flow': institutional_flow,
         'cross_asset':     cross_asset,
         'correlation_score': cross_asset.get('correlation_score', {}),
         'event_positioning': event_positioning,

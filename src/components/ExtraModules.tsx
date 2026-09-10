@@ -432,12 +432,51 @@ export function CorrelationMatrix({ selectedAsset }: ExtraModuleProps) {
 
 // 8. Economic Impact Scanner Component
 export function EconomicImpactScanner({ selectedAsset }: ExtraModuleProps) {
-  const events = [
-    { title: 'Core CPI Price Index (MoM)', time: 'Today, 13:30', impact: 'HIGH', forecast: '0.2%', previous: '0.3%', warning: true },
-    { title: 'FOMC Press Conference', time: 'Tomorrow, 19:00', impact: 'HIGH', forecast: '5.25%', previous: '5.25%', warning: true },
-    { title: 'Initial Jobless Claims', time: 'Thursday, 13:30', impact: 'MED', forecast: '215k', previous: '210k', warning: false },
-    { title: 'S&P Global Composite PMI', time: 'Friday, 14:45', impact: 'MED', forecast: '51.3', previous: '50.9', warning: false },
+  const [calendarEvents, setCalendarEvents] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+
+  useEffect(() => {
+    let isMounted = true;
+    async function loadCalendar() {
+      setIsLoading(true);
+      try {
+        const res = await fetch(`/api/calendar?asset=${encodeURIComponent(selectedAsset)}`);
+        if (res.ok) {
+          const data = await res.json();
+          const eventsList = Array.isArray(data) ? data : (data.events || []);
+          if (isMounted && eventsList.length > 0) {
+            setCalendarEvents(eventsList);
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to load economic calendar:', err);
+      } finally {
+        if (isMounted) setIsLoading(false);
+      }
+    }
+    loadCalendar();
+    return () => { isMounted = false; };
+  }, [selectedAsset]);
+
+  const defaultEvents = [
+    { title: 'Non-Farm Employment Change (NFP)', time: 'Released', impact: 'HIGH', actual: '162k', forecast: '55k', previous: '21k', warning: true },
+    { title: 'Unemployment Rate', time: 'Released', impact: 'HIGH', actual: '4.1%', forecast: '4.1%', previous: '4.1%', warning: true },
+    { title: 'Average Hourly Earnings (MoM)', time: 'Released', impact: 'HIGH', actual: '0.3%', forecast: '0.3%', previous: '0.1%', warning: true },
+    { title: 'Core CPI Price Index (MoM)', time: 'Upcoming', impact: 'HIGH', forecast: '0.2%', previous: '0.3%', warning: true },
+    { title: 'FOMC Rate Decision', time: 'Upcoming', impact: 'HIGH', forecast: '5.25%', previous: '5.25%', warning: true },
   ];
+
+  const displayEvents = calendarEvents.length > 0 
+    ? calendarEvents.slice(0, 6).map((e: any) => ({
+        title: e.title || e.event || 'Economic Release',
+        time: e.time || e.date || 'Today',
+        impact: (e.impact || 'HIGH').toUpperCase(),
+        actual: e.actual || null,
+        forecast: e.forecast || '—',
+        previous: e.previous || '—',
+        warning: (e.impact || '').toUpperCase() === 'HIGH' || /NFP|PAYROLL|CPI|FOMC|RATE|EMPLOYMENT/i.test(e.title || '')
+      }))
+    : defaultEvents;
 
   return (
     <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
@@ -447,15 +486,17 @@ export function EconomicImpactScanner({ selectedAsset }: ExtraModuleProps) {
           <Calendar className="w-4 h-4 text-orange-500" />
           <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Economic Impact Scanner</h3>
         </div>
-        <span className="text-[9px] font-mono bg-red-50 text-red-700 px-2.5 py-0.5 rounded border border-red-200 uppercase font-bold font-mono">Risk Auto-block active</span>
+        <span className="text-[9px] font-mono bg-red-50 text-red-700 px-2.5 py-0.5 rounded border border-red-200 uppercase font-bold font-mono">
+          {isLoading ? 'Syncing...' : 'Risk Auto-block active'}
+        </span>
       </div>
 
       <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
-        Realtime economic indicator feeds linked to risk protection modules. System automatically halts scans ±15m around releases.
+        Realtime institutional indicator feeds linked to risk protection gates. System monitors ±15m execution pauses around tier-1 events and guides post-release market structure synthesis.
       </p>
 
       <div className="flex flex-col gap-2 font-mono">
-        {events.map((e, idx) => (
+        {displayEvents.map((e, idx) => (
           <div key={idx} className={`p-3 rounded-xl border ${e.warning ? 'bg-red-50/40 border-red-100' : 'bg-slate-50 border-slate-200/60'} flex items-start justify-between shadow-sm`}>
             <div>
               <div className="flex items-center gap-1.5">
@@ -467,11 +508,14 @@ export function EconomicImpactScanner({ selectedAsset }: ExtraModuleProps) {
               <span className="text-[10px] text-slate-400 mt-1 block">{e.time}</span>
             </div>
             <div className="text-right text-[10px]">
+              {e.actual && (
+                <span className="text-emerald-700 font-bold block">Actual: <strong className="text-emerald-800">{e.actual}</strong></span>
+              )}
               <span className="text-slate-500 block">Forecast: <strong className="text-slate-800">{e.forecast}</strong></span>
               <span className="text-slate-500 block mt-0.5">Previous: <strong className="text-slate-800">{e.previous}</strong></span>
               {e.warning && (
                 <span className="text-[9px] text-red-600 font-bold mt-1 inline-flex items-center gap-1 leading-none">
-                  <ShieldAlert className="w-3 h-3 text-red-500 animate-pulse" /> Auto-Block Active
+                  <ShieldAlert className="w-3 h-3 text-red-500 animate-pulse" /> High Impact Guard
                 </span>
               )}
             </div>
