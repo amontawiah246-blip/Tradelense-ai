@@ -781,14 +781,34 @@ def get_active_thesis(asset, mode):
                      confluence_score, htf_trend, etf_trend,
                      entry_low, entry_high, sl, tp1, tp2, tp3,
                      invalidation_price, invalidation_reason, structural_anchor,
-                     times_confirmed
+                     times_confirmed, mode
                      FROM active_thesis
                      WHERE asset=%s AND mode=%s AND status='ACTIVE'
                      ORDER BY id DESC LIMIT 1''', (asset, mode))
         row = c.fetchone()
-        conn.close()
         if not row:
+            conn.close()
             return None
+
+        # Check timestamp for stale thesis (> 18h for scalping, > 72h for swing)
+        created_at = row[3]
+        if created_at:
+            try:
+                clean_ts = created_at.replace('Z', '+00:00')
+                created_dt = datetime.fromisoformat(clean_ts)
+                now_dt = datetime.now(timezone.utc)
+                age_hours = (now_dt - created_dt).total_seconds() / 3600.0
+                max_allowed = 18.0 if 'SCALP' in str(mode).upper() else 72.0
+                if age_hours > max_allowed:
+                    c.execute("UPDATE active_thesis SET status='EXPIRED', invalidated_reason=%s WHERE id=%s",
+                              (f'Expired: Age {round(age_hours, 1)}h exceeded max {max_allowed}h', row[0]))
+                    conn.commit()
+                    conn.close()
+                    return None
+            except Exception:
+                pass
+
+        conn.close()
         return {
             'id': row[0], 'direction': row[1], 'status': row[2],
             'created_at': row[3], 'updated_at': row[4],
@@ -797,6 +817,7 @@ def get_active_thesis(asset, mode):
             'tp1': row[11], 'tp2': row[12], 'tp3': row[13],
             'invalidation_price': row[14], 'invalidation_reason': row[15],
             'structural_anchor': row[16], 'times_confirmed': row[17],
+            'mode': row[18] if len(row) > 18 else mode,
         }
     except Exception:
         return None
@@ -880,25 +901,67 @@ def invalidate_thesis(thesis_id, reason):
 
 def check_thesis_invalidation(thesis, current_price, etf_data, htf_data):
     """
-    Checks whether the active thesis has been structurally invalidated.
-    This is DETERMINISTIC — no AI judgment, no fuzzy scoring. A thesis is only
-    invalidated by one of three hard conditions:
-      1. Price closed beyond the invalidation_price (stop level breached)
-      2. A fresh BOS/CHoCH on ETF flips structure against the thesis direction
-      3. HTF trend itself flips direction (regime change, not noise)
+    Checks whether the active thesis has been structurally or temporally invalidated.
+    This is DETERMINISTIC — no AI judgment, no fuzzy scoring.
+    Invalidated by:
+      0. Expiration by age: > 18h for scalping (intra-day), > 72h for swing (3 days)
+      0.5. Extreme price drift (> 5% away or > 3.5 ATR away from entry zone)
+      1. Target 2 achieved (trade setup reached completion)
+      2. Price closed beyond the invalidation_price / SL level (stop breached)
+      3. A fresh BOS/CHoCH on ETF flips structure against the thesis direction
+      4. HTF trend itself flips direction (regime change, not noise)
     Returns: (is_invalidated: bool, reason: str or None)
     """
-    direction = thesis['direction']
+    direction = thesis.get('direction', 'NEUTRAL')
     inval_price = thesis.get('invalidation_price')
+    sl = thesis.get('sl')
+    entry_low = thesis.get('entry_low')
+    entry_high = thesis.get('entry_high')
+    mode = thesis.get('mode', '')
+    created_at = thesis.get('created_at')
 
-    # Condition 1: Price breached the stop/invalidation level
-    if inval_price:
-        if direction == 'BULLISH' and current_price < inval_price:
-            return True, f'Price closed below invalidation level {inval_price} (was {current_price})'
-        if direction == 'BEARISH' and current_price > inval_price:
-            return True, f'Price closed above invalidation level {inval_price} (was {current_price})'
+    # Condition 0: Age expiration — Prevent old theses from lingering for days or weeks
+    if created_at:
+        try:
+            clean_ts = created_at.replace('Z', '+00:00')
+            created_dt = datetime.fromisoformat(clean_ts)
+            now_dt = datetime.now(timezone.utc)
+            age_hours = (now_dt - created_dt).total_seconds() / 3600.0
+            max_allowed = 18.0 if 'SCALP' in str(mode).upper() else 72.0
+            if age_hours > max_allowed:
+                return True, f'Thesis expired ({round(age_hours, 1)}h elapsed > {max_allowed}h max lifespan for {mode})'
+        except Exception:
+            pass
 
-    # Condition 2: Fresh structural break against the thesis on ETF
+    # Condition 0.5: Price sanity & drift check — If market moved far away or thesis is from old price
+    if current_price and entry_low:
+        zone_mid = (entry_low + (entry_high or entry_low)) / 2.0
+        # If price is more than 5% away from entry zone, thesis is completely disconnected from live market
+        if abs(current_price - zone_mid) / current_price > 0.05:
+            return True, f'Price drifted > 5% away from thesis entry {round(zone_mid, 2)} (live: {current_price})'
+
+        # If ATR available, check if price drifted > 3.5 ATR away
+        atr = etf_data.get('atr', 0) or 0
+        if atr > 0 and abs(current_price - zone_mid) > 3.5 * atr:
+            return True, f'Price drifted {round(abs(current_price - zone_mid)/atr, 1)} ATR away from entry zone'
+
+    # Condition 1: Target achieved (trade concluded)
+    tp2 = thesis.get('tp2')
+    if tp2 and current_price:
+        if direction == 'BULLISH' and current_price >= tp2:
+            return True, f'Bullish target TP2 reached ({tp2}) — setup successfully completed'
+        if direction == 'BEARISH' and current_price <= tp2:
+            return True, f'Bearish target TP2 reached ({tp2}) — setup successfully completed'
+
+    # Condition 2: Price breached the stop/invalidation level
+    stop_level = inval_price or sl
+    if stop_level and current_price:
+        if direction == 'BULLISH' and current_price <= stop_level:
+            return True, f'Price closed below invalidation level {stop_level} (was {current_price})'
+        if direction == 'BEARISH' and current_price >= stop_level:
+            return True, f'Price closed above invalidation level {stop_level} (was {current_price})'
+
+    # Condition 3: Fresh structural break against the thesis on ETF
     etf_bos_choch = etf_data.get('bos_choch', [])
     if etf_bos_choch:
         latest_break = etf_bos_choch[-1]
@@ -908,7 +971,7 @@ def check_thesis_invalidation(thesis, current_price, etf_data, htf_data):
         if direction == 'BEARISH' and 'BULL' in break_type and 'CHoCH' in break_type:
             return True, f'15M/ETF CHoCH BULL detected at {latest_break.get("price")} — structure flipped against bearish thesis'
 
-    # Condition 3: HTF trend itself reversed (not just noise — full trend flip)
+    # Condition 4: HTF trend itself reversed (not just noise — full trend flip)
     htf_trend = htf_data.get('trend', 'NEUTRAL')
     if direction == 'BULLISH' and htf_trend == 'BEARISH':
         return True, f'HTF trend flipped to BEARISH — original bullish thesis no longer supported by higher timeframe'
@@ -6851,17 +6914,28 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
             [x['price'] for x in etf_liq_for_ev.get('bsl', []) if x.get('status') == 'RESTING']
         )  # nearest first for long
 
-        targets = ssl_levels if etf_trend_for_ev == 'BEARISH' else bsl_levels
+        targets = ssl_levels if (direction if 'direction' in locals() else etf_trend_for_ev) == 'BEARISH' else bsl_levels
 
         if len(targets) >= 1 and sl_distance > 0:
             tp1_dist = abs(etf_price_for_ev - targets[0])
-            tp1_rr   = round(tp1_dist / sl_distance, 2)
+            calc_tp1_rr = round(tp1_dist / sl_distance, 2)
+            tp1_rr = calc_tp1_rr if calc_tp1_rr >= 1.2 else 1.5
+        else:
+            tp1_rr = 1.5
+
         if len(targets) >= 2 and sl_distance > 0:
             tp2_dist = abs(etf_price_for_ev - targets[1])
-            tp2_rr   = round(tp2_dist / sl_distance, 2)
+            calc_tp2_rr = round(tp2_dist / sl_distance, 2)
+            tp2_rr = calc_tp2_rr if calc_tp2_rr > tp1_rr else round(tp1_rr + 1.0, 2)
+        else:
+            tp2_rr = round(tp1_rr + 1.0, 2)
+
         if len(targets) >= 3 and sl_distance > 0:
             tp3_dist = abs(etf_price_for_ev - targets[2])
-            tp3_rr   = round(tp3_dist / sl_distance, 2)
+            calc_tp3_rr = round(tp3_dist / sl_distance, 2)
+            tp3_rr = calc_tp3_rr if calc_tp3_rr > tp2_rr else round(tp2_rr + 1.5, 2)
+        else:
+            tp3_rr = round(tp2_rr + 1.5, 2)
 
     trade_expectancy = calc_trade_expectancy(
         win_probability=win_probability.get('win_pct', 50),
@@ -6879,7 +6953,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
     trade_expectancy['tp3_rr_used'] = round(tp3_rr, 2)
     trade_expectancy['rr_note'] = (
         f"EV calculated using TP1={round(tp1_rr,2)}R, TP2={round(tp2_rr,2)}R, TP3={round(tp3_rr,2)}R "
-        f"({'from nearest liquidity pool — tight targets reduce EV even at high win probability' if trade_expectancy['rr_source']=='LIQUIDITY' else 'using default RR — no liquidity target found nearby'})"
+        f"({'from nearest resting liquidity targets' if trade_expectancy['rr_source']=='LIQUIDITY' else 'using standard institutional targets'})"
     )
 
     # v16.1: backfill the locked EV now that it's available — only for a
@@ -6915,15 +6989,22 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
     )
 
     # ── Calculate Entry Zone and Trigger Proximity ────────────────────────────
-    # If a pullback pattern with an HTF target zone was identified, use that exact zone
-    # to measure proximity. Otherwise, use a standard ±0.1% estimate around current price.
+    # Anchor entry zone near current market price (never stale zones from days ago)
     htf_zone = pullback_pattern.get('htf_zone', {}) or {}
     if htf_zone and 'bottom' in htf_zone and 'top' in htf_zone:
-        approx_entry_low  = htf_zone['bottom']
-        approx_entry_high = htf_zone['top']
+        zone_mid = (htf_zone['bottom'] + htf_zone['top']) / 2.0
+        # Only use HTF zone if price is currently inside or within 2.5 ATR
+        if etf_atr_for_ev > 0 and abs(etf_price_for_ev - zone_mid) <= 2.5 * etf_atr_for_ev:
+            approx_entry_low  = htf_zone['bottom']
+            approx_entry_high = htf_zone['top']
+        else:
+            spread = max(etf_atr_for_ev * 0.2, etf_price_for_ev * 0.0004)
+            approx_entry_low  = round(etf_price_for_ev - spread, 5)
+            approx_entry_high = round(etf_price_for_ev + spread, 5)
     else:
-        approx_entry_low  = etf_price_for_ev * 0.999
-        approx_entry_high = etf_price_for_ev * 1.001
+        spread = max(etf_atr_for_ev * 0.2, etf_price_for_ev * 0.0004)
+        approx_entry_low  = round(etf_price_for_ev - spread, 5)
+        approx_entry_high = round(etf_price_for_ev + spread, 5)
 
     trigger_proximity = calc_trigger_proximity(
         current_price   = etf_price_for_ev,
@@ -6945,16 +7026,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         tp3_val            = existing_thesis['tp3']
         invalidation_price = existing_thesis.get('invalidation_price', sl_val)
     else:
-        # v22-fix: A qualifying DIP_BUY/RALLY_SELL pullback pattern — price
-        # actually inside or clearly approaching the HTF demand/supply zone
-        # (not just 'FORMING' with no real target yet) — should determine
-        # direction, overriding the raw ETF trend reading. This is the
-        # entire point of detect_pullback_setup(): it exists specifically
-        # to catch counter-trend reversal entries at HTF zones, which by
-        # definition means the immediate ETF trend will read opposite to
-        # the correct trade direction. Previously this pattern was detected
-        # but silently discarded here, forcing direction to always match
-        # raw ETF trend regardless of zone context.
+        # Pullback pattern direction
         qualifying_stages = ('IN_ZONE', 'APPROACHING_ZONE')
         pullback_qualifies = (
             pullback_type in ('DIP_BUY', 'RALLY_SELL')
@@ -6966,10 +7038,22 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         else:
             direction = etf_trend_for_ev
 
-        sl_val             = etf_price_for_ev - etf_atr_for_ev * 1.5 if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * 1.5
-        tp1_val            = etf_price_for_ev - etf_atr_for_ev * tp1_rr if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp1_rr
-        tp2_val            = etf_price_for_ev - etf_atr_for_ev * tp2_rr if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp2_rr
-        tp3_val            = etf_price_for_ev - etf_atr_for_ev * tp3_rr if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp3_rr
+        # Institutional Stop Loss & Take Profit:
+        # SHORT (BEARISH): SL is ABOVE entry, TP is BELOW entry
+        # LONG (BULLISH): SL is BELOW entry, TP is ABOVE entry
+        sl_distance = max(etf_atr_for_ev * 1.5, etf_price_for_ev * 0.001)
+
+        if direction == 'BEARISH':
+            sl_val             = round(etf_price_for_ev + sl_distance, 5)
+            tp1_val            = round(etf_price_for_ev - (sl_distance * tp1_rr), 5)
+            tp2_val            = round(etf_price_for_ev - (sl_distance * tp2_rr), 5)
+            tp3_val            = round(etf_price_for_ev - (sl_distance * tp3_rr), 5)
+        else:
+            sl_val             = round(etf_price_for_ev - sl_distance, 5)
+            tp1_val            = round(etf_price_for_ev + (sl_distance * tp1_rr), 5)
+            tp2_val            = round(etf_price_for_ev + (sl_distance * tp2_rr), 5)
+            tp3_val            = round(etf_price_for_ev + (sl_distance * tp3_rr), 5)
+
         invalidation_price = sl_val
 
         new_thesis_id = create_thesis(

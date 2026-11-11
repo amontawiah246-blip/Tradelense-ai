@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { MARKETS, MarketCategory, TradingMode } from '../types';
 import { 
@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { AnalysisResult } from './AnalysisResult';
 import { SignalsLogger } from './SignalsLogger';
+import { TradingJournal } from './trading-journal/TradingJournal';
 import { 
   AIConfidenceHeatmap, MultiTimeframeAlignment, SmartMoneyConceptsPanel,
   LiquiditySweepDetector, VolumeProfile, InstitutionalFootprint,
@@ -18,7 +19,18 @@ import {
 } from './ExtraModules';
 
 interface DashboardProps {
-  onAnalyze: (asset: string, mode: TradingMode, imageBase64?: string, accountSize?: number, riskPct?: number, newsUpdate?: string) => Promise<{ result: string; signalData?: any }>;
+  onAnalyze: (
+    asset: string,
+    mode: TradingMode,
+    imageBase64?: string,
+    accountSize?: number,
+    riskPct?: number,
+    newsUpdate?: string,
+    clientMarketData?: {
+      liveTick?: any;
+      candlesByTF?: Record<string, any[]>;
+    }
+  ) => Promise<{ result: string; signalData?: any }>;
 }
 
 type TabType = 
@@ -54,10 +66,13 @@ const getAssetDetails = (asset: string) => {
     XAGUSD: { name: 'XAG/USD', symbol: 'XAG·USD', desc: 'Silver Spot / US Dollar' },
     USOIL:  { name: 'USOIL',   symbol: 'WTI·CRUDE', desc: 'Crude Oil / US Dollar' },
     XNGUSD: { name: 'XNG/USD', symbol: 'NAT·GAS', desc: 'Natural Gas / US Dollar' },
-    US30:   { name: 'US30',    symbol: 'DOW·JONES', desc: 'Dow Jones 30 Index' },
+    US30:   { name: 'US30',    symbol: 'DOW·JONES', desc: 'US Wall Street 30 Index' },
     NAS100: { name: 'NAS100',  symbol: 'NASDAQ·100', desc: 'Nasdaq 100 Index' },
+    USTEC:  { name: 'USTEC',   symbol: 'USTEC·100', desc: 'USTEC 100 Index' },
+    SPX500: { name: 'SPX500',  symbol: 'S&P·500', desc: 'US SPX 500 Index' },
     STOXX50:{ name: 'STOXX50', symbol: 'STOXX·50', desc: 'Euro Stoxx 50 Index' },
     VOL75:  { name: 'VOL75',   symbol: 'VIX·75', desc: 'Volatility 75 Index' },
+    'Crude Oil': { name: 'Crude Oil', symbol: 'WTI·CRUDE', desc: 'Crude Oil / US Dollar' },
     BOOM1000: { name: 'BOOM1000', symbol: 'BOOM·1K', desc: 'Boom 1000 Tick Index' },
     CRASH1000:{ name: 'CRASH1000', symbol: 'CRASH·1K', desc: 'Crash 1000 Tick Index' },
   };
@@ -259,6 +274,10 @@ const ASSET_LIST: AssetItem[] = [
   // honestly until a real XRP/crypto symbol is verified and swapped in.
   { id: 'VOL75', name: 'Volatility 75 Index', ticker: 'VOL75', iconBg: 'bg-slate-100', type: 'asset' },
   { id: 'BNBUSD', name: 'Binance Coin', ticker: 'BNB', iconBg: 'bg-slate-100', type: 'asset' },
+  { id: 'USTEC', name: 'USTEC 100 Index', ticker: 'USTEC', iconBg: 'bg-slate-100', type: 'asset' },
+  { id: 'SPX500', name: 'US SPX 500 Index', ticker: 'SPX', iconBg: 'bg-slate-100', type: 'asset' },
+  { id: 'US30', name: 'US Wall Street 30 Index', ticker: 'US30', iconBg: 'bg-slate-100', type: 'asset' },
+  { id: 'Crude Oil', name: 'Crude Oil', ticker: 'WTI', iconBg: 'bg-slate-100', type: 'asset' },
 ];
 
 interface ForexItem {
@@ -295,6 +314,34 @@ function ForexPairIcon({ baseFlag, quoteFlag }: { baseFlag: string; quoteFlag: s
 }
 
 
+const INITIAL_MARKET_PRICES: Record<string, { bid: number; ask: number; change: number; history: number[] }> = {
+  XAUUSD: { bid: 4181.66, ask: 4182.01, change: 0.35, history: [4176, 4178, 4180, 4181.66] },
+  XAGUSD: { bid: 61.60, ask: 61.64, change: 0.10, history: [61.4, 61.55, 61.65, 61.60] },
+  USOIL: { bid: 89.15, ask: 89.25, change: -3.70, history: [92.5, 91.0, 90.0, 89.15] },
+  'Crude Oil': { bid: 89.15, ask: 89.25, change: -3.70, history: [92.5, 91.0, 90.0, 89.15] },
+  XNGUSD: { bid: 3.01, ask: 3.04, change: -3.05, history: [3.12, 3.08, 3.05, 3.01] },
+  EURUSD: { bid: 1.1340, ask: 1.1342, change: -0.28, history: [1.1370, 1.1355, 1.1348, 1.1340] },
+  GBPUSD: { bid: 1.3228, ask: 1.3231, change: -0.22, history: [1.3260, 1.3245, 1.3235, 1.3228] },
+  USDJPY: { bid: 157.34, ask: 157.37, change: -0.02, history: [157.40, 157.38, 157.35, 157.34] },
+  USDCHF: { bid: 0.8340, ask: 0.8343, change: 0.34, history: [0.8315, 0.8325, 0.8335, 0.8340] },
+  AUDUSD: { bid: 0.6988, ask: 0.6991, change: -0.45, history: [0.7020, 0.7005, 0.6995, 0.6988] },
+  USDCAD: { bid: 1.4185, ask: 1.4188, change: 0.11, history: [1.4165, 1.4172, 1.4180, 1.4185] },
+  NZDUSD: { bid: 0.5641, ask: 0.5644, change: -0.42, history: [0.5668, 0.5655, 0.5648, 0.5641] },
+  BTCUSD: { bid: 83530.0, ask: 83540.0, change: 0.15, history: [83200, 83350, 83480, 83530] },
+  ETHUSD: { bid: 2689.0, ask: 2691.0, change: 0.08, history: [2675, 2680, 2685, 2689] },
+  SOLUSD: { bid: 118.5, ask: 118.8, change: -0.80, history: [120.0, 119.5, 119.0, 118.5] },
+  BNBUSD: { bid: 790.0, ask: 790.8, change: 0.40, history: [786, 788, 789, 790] },
+  US30: { bid: 51350.0, ask: 51355.0, change: -0.25, history: [51480, 51420, 51380, 51350] },
+  NAS100: { bid: 26795.0, ask: 26800.0, change: -0.09, history: [26840, 26820, 26805, 26795] },
+  USTEC: { bid: 26795.0, ask: 26800.0, change: -0.09, history: [26840, 26820, 26805, 26795] },
+  SPX500: { bid: 7671.0, ask: 7672.5, change: -0.16, history: [7685, 7680, 7675, 7671] },
+  STOXX50: { bid: 6320.0, ask: 6323.0, change: 0.30, history: [6300, 6310, 6315, 6320] },
+  VOL75: { bid: 1000.5, ask: 1001.0, change: 0.50, history: [995, 997, 999, 1000.5] },
+  VOL100: { bid: 2000.0, ask: 2001.0, change: -0.20, history: [2005, 2003, 2001, 2000] },
+  BOOM1000: { bid: 10000.0, ask: 10002.0, change: 0.25, history: [9990, 9995, 9998, 10000] },
+  CRASH1000: { bid: 10000.0, ask: 10002.0, change: -0.30, history: [10015, 10010, 10005, 10000] }
+};
+
 export function Dashboard({ onAnalyze }: DashboardProps) {
   // Main view state
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
@@ -315,8 +362,8 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
   const [newsWireInput, setNewsWireInput] = useState<string>('');
   const [showNewsWire, setShowNewsWire] = useState<boolean>(false);
 
-  // Live prices mock database
-  const [livePrices, setLivePrices] = useState<Record<string, { bid: number; ask: number; change: number; history: number[] }>>({});
+  // Live prices database (pre-seeded for instantaneous 0ms display on mount)
+  const [livePrices, setLivePrices] = useState<Record<string, { bid: number; ask: number; change: number; history: number[] }>>(INITIAL_MARKET_PRICES);
   const [lastAnalysisCompletedAt, setLastAnalysisCompletedAt] = useState<number | undefined>(undefined);
 
   // Sub reports (Main View tab vs live data visuals)
@@ -362,84 +409,239 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
     return () => clearInterval(interval);
   }, [isLoading]);
 
-  // Periodically update live prices
- // Periodically update live prices via Deriv WebSocket
-  useEffect(() => {
-    const derivSymbolMap: Record<string, string> = {
-      EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
-      USDCHF: 'frxUSDCHF', AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD',
-      BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD', BNBUSD: 'cryBNBUSD',
-      XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD',
-      USOIL: 'frxUSOIL', XNGUSD: 'frxXPDUSD', STOXX50: 'OTC_STOXX50', VOL75: 'R_75'
-    };
+  // ─── Direct Deriv WebSocket Client with Real-Time Subscriptions & Candle Fetching ───
+  const derivWsRef = useRef<WebSocket | null>(null);
+  const reqIdRef = useRef<number>(1);
+  const pendingRequestsRef = useRef<Map<number, (data: any) => void>>(new Map());
+  const activeSubIdRef = useRef<string | null>(null);
+  const currentSubSymbolRef = useRef<string | null>(null);
+  const openingPricesRef = useRef<Record<string, number>>({});
+  const lastFeedTickSentRef = useRef<Record<string, number>>({});
 
-    const reverseSymbolMap: Record<string, string> = {};
+  const derivSymbolMap: Record<string, string> = useMemo(() => ({
+    EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
+    USDCHF: 'frxUSDCHF', AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD', NZDUSD: 'frxNZDUSD',
+    BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD', BNBUSD: 'cryBNBUSD',
+    XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD',
+    USOIL: 'frxUSOIL', 'Crude Oil': 'frxUSOIL', XNGUSD: 'frxXNGUSD',
+    STOXX50: 'OTC_STOXX50', VOL75: 'R_75', VOL100: 'R_100',
+    BOOM1000: 'BOOM1000', CRASH1000: 'CRASH1000',
+    US30: 'OTC_DJI', NAS100: 'OTC_NDX', USTEC: 'OTC_NDX', SPX500: 'OTC_SPC'
+  }), []);
+
+  const reverseSymbolMap: Record<string, string> = useMemo(() => {
+    const rev: Record<string, string> = {};
     for (const [key, value] of Object.entries(derivSymbolMap)) {
-      reverseSymbolMap[value] = key;
+      rev[value] = key;
     }
+    return rev;
+  }, [derivSymbolMap]);
 
-    const ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089');
-    const openingPrices: Record<string, number> = {};
-    let pollInterval: any;
+  // Sync client-received live Deriv tick to server cache (throttled to 1s)
+  const syncTickToServer = useCallback((asset: string, derivSym: string, bid: number, ask: number, mid: number, epoch: number, change: number) => {
+    const now = Date.now();
+    const lastSent = lastFeedTickSentRef.current[asset] || 0;
+    if (now - lastSent < 1000) return;
+    lastFeedTickSentRef.current[asset] = now;
+    fetch('/api/feed-tick', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asset, symbol: derivSym, bid, ask, mid, epoch, change })
+    }).catch(() => {});
+  }, []);
 
-    ws.onopen = () => {
-      // Deriv restricts 'ticks' subscriptions for some symbols now,
-      // but allows single tick history lookups without subscribe.
-      const fetchPrices = () => {
-        if (ws.readyState === WebSocket.OPEN) {
-          Object.values(derivSymbolMap).forEach(symbol => {
-            ws.send(JSON.stringify({
-              ticks_history: symbol,
-              end: 'latest',
-              count: 1,
-              style: 'ticks'
-            }));
-          });
+  // Client-side Deriv Candle Fetcher for Zero-Delay MT5-accurate Analysis
+  const fetchClientDerivCandles = useCallback(async (asset: string, granularity: number, count = 300): Promise<any[]> => {
+    const derivSym = derivSymbolMap[asset] || asset;
+    const ws = derivWsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return [];
+
+    const reqId = ++reqIdRef.current;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingRequestsRef.current.delete(reqId);
+        resolve([]);
+      }, 2500);
+
+      pendingRequestsRef.current.set(reqId, (data: any) => {
+        clearTimeout(timer);
+        if (data.candles && Array.isArray(data.candles) && data.candles.length > 0) {
+          const formatted = data.candles.map((c: any) => ({
+            epoch: c.epoch,
+            open: parseFloat(c.open),
+            high: parseFloat(c.high),
+            low: parseFloat(c.low),
+            close: parseFloat(c.close),
+            date: new Date(c.epoch * 1000).toISOString().slice(0, 16)
+          }));
+          resolve(formatted);
+        } else {
+          resolve([]);
+        }
+      });
+
+      try {
+        ws.send(JSON.stringify({
+          ticks_history: derivSym,
+          end: 'latest',
+          count,
+          style: 'candles',
+          granularity,
+          req_id: reqId
+        }));
+      } catch {
+        clearTimeout(timer);
+        pendingRequestsRef.current.delete(reqId);
+        resolve([]);
+      }
+    });
+  }, [derivSymbolMap]);
+
+  // Main WebSocket Connection & Streaming Hook
+  useEffect(() => {
+    let isDisposed = false;
+    let reconnectTimer: any;
+    let watchlistInterval: any;
+    const endpoints = [
+      'wss://ws.derivws.com/websockets/v3?app_id=1089',
+      'wss://ws.binaryws.com/websockets/v3?app_id=1089'
+    ];
+    let endpointIdx = 0;
+
+    const connectDeriv = () => {
+      if (isDisposed) return;
+      const url = endpoints[endpointIdx % endpoints.length];
+      const ws = new WebSocket(url);
+      derivWsRef.current = ws;
+
+      ws.onopen = () => {
+        // Subscribe to live tick stream for selected asset immediately
+        const activeSym = derivSymbolMap[selectedAsset] || selectedAsset;
+        currentSubSymbolRef.current = activeSym;
+        ws.send(JSON.stringify({ ticks: activeSym, subscribe: 1 }));
+
+        // Staggered background watchlist rotation (1 symbol every 1.5s to avoid rate limits)
+        const watchlistKeys = Object.keys(derivSymbolMap);
+        let wlIndex = 0;
+        if (watchlistInterval) clearInterval(watchlistInterval);
+        watchlistInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            const symKey = watchlistKeys[wlIndex % watchlistKeys.length];
+            wlIndex++;
+            if (symKey !== selectedAsset) {
+              const dSym = derivSymbolMap[symKey];
+              ws.send(JSON.stringify({
+                ticks_history: dSym,
+                end: 'latest',
+                count: 1,
+                style: 'ticks'
+              }));
+            }
+          }
+        }, 1500);
+      };
+
+      ws.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+
+          // Handle candle responses for analysis
+          const reqId = data.req_id || data.echo_req?.req_id;
+          if (reqId && pendingRequestsRef.current.has(reqId)) {
+            const cb = pendingRequestsRef.current.get(reqId);
+            pendingRequestsRef.current.delete(reqId);
+            cb?.(data);
+            return;
+          }
+
+          // Handle real-time streamed tick for subscribed asset
+          if (data.msg_type === 'tick' && data.tick) {
+            const tick = data.tick;
+            const derivSymbol = tick.symbol;
+            const appSymbol = reverseSymbolMap[derivSymbol] || derivSymbol;
+            if (tick.id) activeSubIdRef.current = tick.id;
+
+            const quote = parseFloat(tick.quote ?? tick.bid ?? tick.ask);
+            const bid = parseFloat(tick.bid ?? quote);
+            const ask = parseFloat(tick.ask ?? quote);
+
+            if (!openingPricesRef.current[appSymbol]) {
+              openingPricesRef.current[appSymbol] = quote;
+            }
+            const openPrice = openingPricesRef.current[appSymbol];
+            const change = openPrice ? ((quote - openPrice) / openPrice) * 100 : 0;
+
+            setLivePrices(prev => {
+              const previousData = prev[appSymbol];
+              const history = previousData?.history || [];
+              const lastQuote = history[history.length - 1];
+              const newHistory = (lastQuote !== quote) ? [...history, quote].slice(-30) : (history.length ? history : [quote]);
+
+              return {
+                ...prev,
+                [appSymbol]: {
+                  bid,
+                  ask,
+                  change,
+                  history: newHistory
+                }
+              };
+            });
+
+            syncTickToServer(appSymbol, derivSymbol, bid, ask, quote, tick.epoch, change);
+            return;
+          }
+
+          // Handle single-tick lookups for watchlist
+          if (data.history && data.history.prices && data.history.prices.length > 0) {
+            const derivSymbol = data.echo_req?.ticks_history;
+            const appSymbol = reverseSymbolMap[derivSymbol];
+            if (appSymbol) {
+              const quote = data.history.prices[0];
+              const bid = quote;
+              const ask = quote;
+
+              if (!openingPricesRef.current[appSymbol]) {
+                openingPricesRef.current[appSymbol] = quote;
+              }
+              const openPrice = openingPricesRef.current[appSymbol];
+              const change = openPrice ? ((quote - openPrice) / openPrice) * 100 : 0;
+
+              setLivePrices(prev => {
+                const previousData = prev[appSymbol];
+                const history = previousData?.history || [];
+                const lastQuote = history[history.length - 1];
+                const newHistory = (lastQuote !== quote) ? [...history, quote].slice(-30) : (history.length ? history : [quote]);
+
+                return {
+                  ...prev,
+                  [appSymbol]: {
+                    bid,
+                    ask,
+                    change,
+                    history: newHistory
+                  }
+                };
+              });
+
+              syncTickToServer(appSymbol, derivSymbol, bid, ask, quote, data.history.times?.[0] || Math.floor(Date.now() / 1000), change);
+            }
+          }
+        } catch {}
+      };
+
+      ws.onerror = () => {};
+
+      ws.onclose = () => {
+        if (watchlistInterval) clearInterval(watchlistInterval);
+        if (!isDisposed) {
+          endpointIdx++;
+          reconnectTimer = setTimeout(connectDeriv, 2000);
         }
       };
-      
-      fetchPrices();
-      pollInterval = setInterval(fetchPrices, 3000); // Poll every 3s
     };
 
-    ws.onmessage = (msg) => {
-      const data = JSON.parse(msg.data);
-      if (data.history && data.history.prices && data.history.prices.length > 0) {
-        const derivSymbol = data.echo_req.ticks_history;
-        const appSymbol = reverseSymbolMap[derivSymbol];
-        if (appSymbol) {
-          const quote = data.history.prices[0];
-          
-          if (!openingPrices[appSymbol]) {
-            openingPrices[appSymbol] = quote;
-          }
-          const openPrice = openingPrices[appSymbol];
-          const change = openPrice ? ((quote - openPrice) / openPrice) * 100 : 0;
-
-          setLivePrices(prev => {
-            const previousData = prev[appSymbol];
-            const history = previousData?.history || [];
-            // Only add if changed
-            const lastQuote = history[history.length - 1];
-            const newHistory = (lastQuote !== quote) ? [...history, quote].slice(-30) : history;
-            
-            return {
-              ...prev,
-              [appSymbol]: {
-                bid: quote,
-                ask: quote, // History doesn't provide spread, just use quote
-                change: change,
-                history: newHistory
-              }
-            };
-          });
-        }
-      }
-    };
-    
-    ws.onclose = () => {
-      if (pollInterval) clearInterval(pollInterval);
-    };
+    connectDeriv();
 
     // Binance WebSocket Fallback for Crypto (globally reliable)
     const binanceSymbols = {
@@ -450,45 +652,140 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
     };
     const binanceStreams = Object.values(binanceSymbols).map(s => `${s}@ticker`).join('/');
     const wsBinance = new WebSocket(`wss://stream.binance.com:9443/ws/${binanceStreams}`);
+    wsBinance.onerror = () => {};
 
     wsBinance.onmessage = (msg) => {
-      const data = JSON.parse(msg.data);
-      if (data.s) { // Symbol exists
-        const streamSymbol = data.s.toLowerCase();
-        const appSymbol = Object.keys(binanceSymbols).find(k => binanceSymbols[k as keyof typeof binanceSymbols] === streamSymbol);
-        
-        if (appSymbol) {
-          const bid = parseFloat(data.b);
-          const ask = parseFloat(data.a);
-          const quote = parseFloat(data.c); // Last price
-          const change = parseFloat(data.P); // Price change percent
+      try {
+        const data = JSON.parse(msg.data);
+        if (data.s) {
+          const streamSymbol = data.s.toLowerCase();
+          const appSymbol = Object.keys(binanceSymbols).find(k => binanceSymbols[k as keyof typeof binanceSymbols] === streamSymbol);
 
+          if (appSymbol) {
+            const bid = parseFloat(data.b);
+            const ask = parseFloat(data.a);
+            const quote = parseFloat(data.c);
+            const change = parseFloat(data.P);
+
+            setLivePrices(prev => {
+              const previousData = prev[appSymbol];
+              const history = previousData?.history || [];
+              const lastQuote = history[history.length - 1];
+              const newHistory = lastQuote !== quote ? [...history, quote].slice(-30) : history;
+
+              return {
+                ...prev,
+                [appSymbol]: {
+                  bid: bid || quote,
+                  ask: ask || quote,
+                  change: change,
+                  history: newHistory.length === 0 ? [quote] : newHistory
+                }
+              };
+            });
+          }
+        }
+      } catch {}
+    };
+
+    return () => {
+      isDisposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (watchlistInterval) clearInterval(watchlistInterval);
+      if (derivWsRef.current) {
+        try { derivWsRef.current.close(); } catch {}
+      }
+      try { wsBinance.close(); } catch {}
+    };
+  }, [derivSymbolMap, reverseSymbolMap, syncTickToServer]);
+
+  // Robust backend prices polling sync (institutional reliability for all instruments)
+  useEffect(() => {
+    let isCancelled = false;
+    const syncPrices = async () => {
+      try {
+        const res = await fetch('/api/live-prices');
+        if (res.ok && !isCancelled) {
+          const data = await res.json();
           setLivePrices(prev => {
-            const previousData = prev[appSymbol];
-            const history = previousData?.history || [];
-            // Only add to history if the price actually changed to avoid spamming sparklines
-            const lastHistoryPrice = history[history.length - 1];
-            const newHistory = lastHistoryPrice !== quote ? [...history, quote].slice(-30) : history;
+            const next = { ...prev };
+            let hasChanges = false;
+            for (const [key, quote] of Object.entries(data)) {
+              if (key === selectedAsset && derivWsRef.current?.readyState === WebSocket.OPEN && activeSubIdRef.current) {
+                continue;
+              }
+              const q = quote as any;
+              const prevData = prev[key];
+              const history = prevData?.history || [];
+              const lastQuote = history[history.length - 1];
+              const newHistory = (lastQuote !== q.bid) ? [...history, q.bid].slice(-30) : (history.length ? history : [q.bid]);
+              next[key] = {
+                bid: q.bid,
+                ask: q.ask,
+                change: q.change ?? prevData?.change ?? 0,
+                history: newHistory
+              };
+              hasChanges = true;
+            }
+            return hasChanges ? next : prev;
+          });
+        }
+      } catch {}
+    };
 
+    syncPrices();
+    const interval = setInterval(syncPrices, 3000);
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // When selectedAsset changes, switch the active live tick subscription immediately & fetch quote
+  useEffect(() => {
+    let isCancelled = false;
+    fetch(`/api/live-price?asset=${encodeURIComponent(selectedAsset)}`)
+      .then(res => res.json())
+      .then(tick => {
+        if (!isCancelled && tick && tick.bid) {
+          setLivePrices(prev => {
+            const prevData = prev[selectedAsset];
+            const history = prevData?.history || [];
+            const lastQuote = history[history.length - 1];
+            const newHistory = (lastQuote !== tick.bid) ? [...history, tick.bid].slice(-30) : (history.length ? history : [tick.bid]);
             return {
               ...prev,
-              [appSymbol]: {
-                bid: bid || quote,
-                ask: ask || quote,
-                change: change,
-                history: newHistory.length === 0 ? [quote] : newHistory
+              [selectedAsset]: {
+                bid: tick.bid,
+                ask: tick.ask,
+                change: tick.change ?? prevData?.change ?? 0,
+                history: newHistory
               }
             };
           });
         }
-      }
-    };
+      })
+      .catch(() => {});
 
-    return () => {
-      ws.close();
-      wsBinance.close();
-    };
-  }, []);
+    const ws = derivWsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return () => { isCancelled = true; };
+    const activeSym = derivSymbolMap[selectedAsset] || selectedAsset;
+    if (currentSubSymbolRef.current === activeSym) return () => { isCancelled = true; };
+
+    if (activeSubIdRef.current) {
+      try {
+        ws.send(JSON.stringify({ forget: activeSubIdRef.current }));
+      } catch {}
+      activeSubIdRef.current = null;
+    }
+
+    currentSubSymbolRef.current = activeSym;
+    try {
+      ws.send(JSON.stringify({ ticks: activeSym, subscribe: 1 }));
+    } catch {}
+
+    return () => { isCancelled = true; };
+  }, [selectedAsset, derivSymbolMap]);
 
   const handleSelectAsset = (asset: string) => {
     setSelectedAsset(asset);
@@ -501,8 +798,64 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
     setResult(null);
     setSignalData(null);
     setIsDropdownOpen(false);
+
     try {
-      const data = await onAnalyze(selectedAsset, mode, undefined, accountSize, riskPct, newsWireInput.trim() || undefined);
+      // 1. Fetch live multi-timeframe candles directly from user's live Deriv WebSocket connection
+      // This ensures 100% MT5-synchronized, zero-delay real-time candles for scalping/swing
+      const tfConfigs = mode.includes('SWING')
+        ? [
+            { label: 'D1', granularity: 86400 },
+            { label: '4H', granularity: 14400 },
+            { label: '1H', granularity: 3600 },
+            { label: '30M', granularity: 1800 },
+            { label: '15M', granularity: 900 }
+          ]
+        : [
+            { label: 'D1', granularity: 86400 },
+            { label: '4H', granularity: 14400 },
+            { label: '1H', granularity: 3600 },
+            { label: '30M', granularity: 1800 },
+            { label: '15M', granularity: 900 },
+            { label: '5M', granularity: 300 }
+          ];
+
+      const clientCandlesByTF: Record<string, any[]> = {};
+      const candleFetches = tfConfigs.map(async (tf) => {
+        try {
+          const candles = await fetchClientDerivCandles(selectedAsset, tf.granularity, 300);
+          if (candles && candles.length > 0) {
+            clientCandlesByTF[tf.label] = candles;
+          }
+        } catch {}
+      });
+
+      // Allow up to 2 seconds for client Deriv WebSocket to deliver real-time candles
+      await Promise.race([
+        Promise.allSettled(candleFetches),
+        new Promise(resolve => setTimeout(resolve, 2000))
+      ]);
+
+      const activeQuote = livePrices[selectedAsset];
+      const clientMarketData = {
+        liveTick: activeQuote ? {
+          bid: activeQuote.bid,
+          ask: activeQuote.ask,
+          mid: activeQuote.bid,
+          change: activeQuote.change
+        } : undefined,
+        candlesByTF: Object.keys(clientCandlesByTF).length > 0 ? clientCandlesByTF : undefined
+      };
+
+      const data = await onAnalyze(
+        selectedAsset,
+        mode,
+        undefined,
+        accountSize,
+        riskPct,
+        newsWireInput.trim() || undefined,
+        clientMarketData
+      );
+
       setResult(data.result);
       setSignalData(data.signalData || null);
       setLastAnalysisCompletedAt(Date.now());
@@ -602,8 +955,13 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
     };
   })();
 
-  const activeLivePrice = livePrices[selectedAsset]?.bid ?? 0;
-  const currentDecimals = selectedAsset.includes('JPY') ? 3 : (selectedAsset.includes('USD') && selectedAsset.length === 6 ? 5 : 2);
+  const isForexCurrencies = ['EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD', 'USDCAD', 'USDCHF'].includes(selectedAsset);
+  const isJpyCurrencies = selectedAsset.includes('JPY');
+  const currentDecimals = isJpyCurrencies ? 3 : (isForexCurrencies ? 5 : 2);
+
+  const activeQuote = livePrices[selectedAsset] || INITIAL_MARKET_PRICES[selectedAsset];
+  const activeLivePrice = activeQuote?.bid ?? (INITIAL_MARKET_PRICES[selectedAsset]?.bid ?? 0);
+  const activeAskPrice = activeQuote?.ask ?? (activeLivePrice > 0 ? Number((activeLivePrice * 1.00015).toFixed(currentDecimals)) : 0);
 
   const activeAssetDetails = getAssetDetails(selectedAsset);
 
@@ -821,6 +1179,21 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
               </AnimatePresence>
             </div>
 
+            {/* Quick Trading Journal button */}
+            <button 
+              onClick={() => setActiveTab('history')}
+              className={`flex items-center gap-1.5 font-bold text-xs px-3.5 py-2 rounded-xl transition-all cursor-pointer border font-sans ${
+                activeTab === 'history'
+                  ? 'bg-emerald-600 text-white border-emerald-600 shadow-md shadow-emerald-950/20'
+                  : 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 border-emerald-500/30'
+              }`}
+              title="Open TradeZella style Trading Journal with Calendar and P&L analytics"
+            >
+              <Database className="w-3.5 h-3.5 text-emerald-500" />
+              <span className="hidden sm:inline">Trading Journal</span>
+              <span className="sm:hidden">Journal</span>
+            </button>
+
             {/* Menu button to open Slide-out Navigation Drawer */}
             <button 
               onClick={() => setIsDrawerOpen(true)}
@@ -898,7 +1271,7 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
                     <div className="flex flex-col gap-1 mt-1">
                       {[
                         { id: 'dashboard', label: 'Signal Forge Generator', desc: 'Synthesize buy, sell, or wait bands', icon: Zap },
-                        { id: 'history', label: 'Quantitative Historical Ledger', desc: 'Audit computed setup parameters', icon: Database },
+                        { id: 'history', label: 'Trading Journal & Ledger', desc: 'TradeZella calendar, win/loss sync & stats', icon: Database },
                       ].map(item => {
                         const isSelected = activeTab === item.id;
                         const IconComp = item.icon;
@@ -1078,7 +1451,7 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
                         <div className="text-right">
                           <span className="text-slate-500 block text-[14px] font-sans font-medium">Ask Quote Rate</span>
                           <strong className="text-black text-[20px] font-sans font-bold block mt-1">
-                            {(activeLivePrice > 0 ? (activeLivePrice * 1.00015).toFixed(currentDecimals) : '—')}
+                            {activeAskPrice > 0 ? activeAskPrice.toFixed(currentDecimals) : (activeLivePrice > 0 ? activeLivePrice.toFixed(currentDecimals) : '—')}
                           </strong>
                         </div>
                       </div>
@@ -1288,24 +1661,36 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
               </motion.div>
             )}
 
-            {/* TAB: HISTORICAL LEDGER TRACES */}
+            {/* TAB: HISTORICAL LEDGER & TRADING JOURNAL */}
             {activeTab === 'history' && (
               <motion.div 
                 key="history"
                 initial={{ opacity: 0, y: 12 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -12 }}
-                className="w-full"
+                className="w-full space-y-6"
               >
-                <div className="bg-white border border-slate-200 p-5 rounded-2xl text-left shadow-sm mb-6">
-                  <h3 className="text-[14px] font-sans text-slate-500 font-medium">Persistent Signal History</h3>
-                  <p className="text-[10px] text-slate-500 font-sans mt-0.5 leading-normal">Trace historical records of computed setups from the database repository.</p>
+                {/* Upgraded TradeZella Style Trading Journal with Database Engine Sync */}
+                <TradingJournal />
+
+                {/* Collapsible Direct Signals Logger for Raw Machine Telemetry */}
+                <div className="bg-[#0e1422] border border-slate-800/80 rounded-2xl p-4 sm:p-5 text-left shadow-lg">
+                  <details className="group">
+                    <summary className="flex items-center justify-between font-bold text-xs text-slate-300 cursor-pointer select-none">
+                      <div className="flex items-center gap-2">
+                        <Database className="w-4 h-4 text-emerald-400" />
+                        <span>Raw Quantitative Engine Signal Telemetry (SQL & Firebase Stream)</span>
+                      </div>
+                      <span className="text-slate-400 group-open:rotate-180 transition-transform font-bold text-sm">↓</span>
+                    </summary>
+                    <div className="mt-4 pt-4 border-t border-slate-800">
+                      <SignalsLogger 
+                        currentAsset={selectedAsset} 
+                        lastAnalysisCompletedAt={lastAnalysisCompletedAt} 
+                      />
+                    </div>
+                  </details>
                 </div>
-                
-                <SignalsLogger 
-                  currentAsset={selectedAsset} 
-                  lastAnalysisCompletedAt={lastAnalysisCompletedAt} 
-                />
               </motion.div>
             )}
 

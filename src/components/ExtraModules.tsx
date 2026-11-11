@@ -15,7 +15,7 @@ interface ExtraModuleProps {
 
 // 1. AI Confidence Heatmap Component
 export function AIConfidenceHeatmap({ selectedAsset, onAssetChange }: ExtraModuleProps) {
-  const assets = ['XAUUSD', 'BTCUSD', 'US30', 'EURUSD', 'GBPUSD', 'NAS100'];
+  const assets = ['XAUUSD', 'BTCUSD', 'US30', 'EURUSD', 'GBPUSD', 'NAS100', 'USTEC', 'SPX500', 'Crude Oil'];
   const timeframes = ['5M', '15M', '1H', '4H', 'D1'];
   
   // Deterministic seed-based confidence values

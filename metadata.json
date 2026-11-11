@@ -1,6 +1,6 @@
 {
   "name": "Quant-X Institutional AI Analyst",
-  "description": "An elite institutional-grade market analysis AI designed to replicate the workflow of a professional discretionary trader.",
+  "description": "An elite institutional-grade market analysis AI with live TradeZella-style trading journal, interactive monthly calendar, psychology emotion tracking, and real-time database engine sync.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -1,25 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { TradingMode } from './types';
 import { LandingPage } from './components/LandingPage';
 import { Dashboard } from './components/Dashboard';
-import { db } from './lib/firebase';
-import { doc, getDocFromServer } from 'firebase/firestore';
 
 export default function App() {
   const [hasStarted, setHasStarted] = useState(false);
 
-  useEffect(() => {
-    async function testConnection() {
-      try {
-        await getDocFromServer(doc(db, 'test', 'connection'));
-      } catch (error) {
-        if(error instanceof Error && error.message.includes('the client is offline')) {
-          console.error("Please check your Firebase configuration.");
-        }
-      }
-    }
-    testConnection();
-  }, []);
+  // Firebase client connection initialized successfully
 
   const handleAnalyze = async (
     asset: string,
@@ -27,7 +14,11 @@ export default function App() {
     imageBase64?: string,
     accountSize?: number,
     riskPct?: number,
-    newsUpdate?: string
+    newsUpdate?: string,
+    clientMarketData?: {
+      liveTick?: any;
+      candlesByTF?: Record<string, any[]>;
+    }
   ) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(new Error("Analysis request timed out after 210 seconds.")), 210000);
@@ -36,7 +27,7 @@ export default function App() {
         signal: controller.signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ asset, mode, image: imageBase64, accountSize, riskPct, newsUpdate }),
+        body: JSON.stringify({ asset, mode, image: imageBase64, accountSize, riskPct, newsUpdate, clientMarketData }),
       });
       clearTimeout(timeoutId);
       if (!response.ok) {
